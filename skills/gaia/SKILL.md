@@ -35,7 +35,9 @@ gaia auth login --provider openai --method oauth
 ```
 
 Use manual API-key authentication only when the user explicitly asks for it.
-Never print access or refresh tokens.
+Never read, copy, or print Codex access or refresh tokens. Verify the delegated
+session with `codex login status`; GAIA should use the Codex transport rather
+than turning that session into `OPENAI_API_KEY`.
 
 ## Run one goal
 

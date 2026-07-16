@@ -1,30 +1,29 @@
 """Local authentication helpers for GAIA.
 
-This module stores provider tokens locally and now prefers OAuth for OpenAI.
+Manual provider keys may be stored locally. OpenAI OAuth remains owned by the
+Codex CLI and is never copied into GAIA storage or environment variables.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from hashlib import sha256
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
 import argparse
-import base64
 import os
 import getpass
 import json
 import re
-import shutil
-import subprocess
 import sys
-import threading
-import time
 import webbrowser
 from typing import Any
 
-import requests
+from gaia.codex_auth import (
+    CODEX_AUTH_SOURCE,
+    CODEX_OAUTH_TOKEN_SENTINEL,
+    codex_cli_path,
+    is_codex_cli_authenticated,
+    run_codex_login,
+)
 
 
 AUTH_DIR = Path.home() / ".gaia" / "auth"
@@ -51,17 +50,6 @@ PROVIDER_LOGIN_URL = {
     "gemini": "https://aistudio.google.com/app/apikey",
     "ollama": "",
 }
-
-OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-OPENAI_OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
-OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-OPENAI_OAUTH_REDIRECT_URI = "http://127.0.0.1:1455/auth/callback"
-OPENAI_OAUTH_SCOPE = "openid profile email offline_access"
-OPENAI_OAUTH_CALLBACK_HOST = "127.0.0.1"
-OPENAI_OAUTH_CALLBACK_PORT = 1455
-OPENAI_OAUTH_CALLBACK_PATH = "/auth/callback"
-CODEX_AUTH_SERVICE_NAME = "Codex Auth"
-
 
 @dataclass
 class AuthProfile:
@@ -251,102 +239,12 @@ def _now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def _now_ts() -> int:
-    return int(time.time())
-
-
-def _to_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except Exception:
-        return None
-
-
-def _parse_code(raw: str) -> str | None:
-    value = raw.strip()
-    if not value:
-        return None
-
-    parsed = urlparse(value)
-    params = parse_qs(parsed.query or "")
-    if params:
-        if params.get("code"):
-            return params["code"][0]
-        if params.get("auth_code"):
-            return params["auth_code"][0]
-
-    fragment = parse_qs(parsed.fragment or "")
-    if fragment.get("code"):
-        return fragment["code"][0]
-
-    if "code=" in value:
-        match = re.search(r"code=([^&\s]+)", value)
-        if match:
-            return match.group(1)
-
-    return value
-
-
-def _b64url(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def _decode_jwt_claim(token: str, key: str) -> str | None:
-    if not token or token.count(".") != 2:
-        return None
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * ((4 - len(payload) % 4) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
-        if isinstance(data, dict):
-            value = data.get(key)
-            if isinstance(value, str):
-                return value
-    except Exception:
-        return None
-    return None
-
-
 def _openid_state_profile(provider: str) -> dict[str, Any] | None:
     return _load_profiles().get(provider)
 
 
-def _is_oauth_provider(provider: str) -> bool:
-    return provider == "openai"
-
-
 def _is_oauth_source(source: Any) -> bool:
     return isinstance(source, str) and source.strip().lower().startswith("oauth")
-
-
-def _is_oauth_token_expired(profile: dict[str, Any]) -> bool:
-    source = profile.get("source")
-    metadata = profile.get("metadata")
-    if not _is_oauth_source(source) or not isinstance(metadata, dict):
-        return False
-    expires_at = _to_int(metadata.get("expires_at"))
-    if not expires_at:
-        return False
-    return expires_at <= _now_ts() + 30
-
-
-def _post_oauth_token(payload: dict[str, str]) -> dict[str, Any]:
-    try:
-        response = requests.post(OPENAI_OAUTH_TOKEN_URL, data=payload, timeout=30)
-    except Exception as exc:
-        raise RuntimeError(f"OpenAI 토큰 교환 요청 실패: {exc}") from exc
-
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"토큰 교환 실패: {response.status_code} {response.text[:200]}"
-        )
-
-    try:
-        return response.json()
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"토큰 응답 형식 오류: {response.text[:200]}") from exc
 
 
 def _save_provider_profile(provider: str, token: str, source: str = "manual", metadata: dict[str, Any] | None = None) -> None:
@@ -361,145 +259,16 @@ def _save_provider_profile(provider: str, token: str, source: str = "manual", me
     _save_profiles(payload)
 
 
-def _refresh_openai_token(profile: dict[str, Any]) -> str | None:
-    metadata = profile.get("metadata")
-    if not isinstance(metadata, dict):
-        return None
-    refresh_token = metadata.get("refresh_token")
-    if not isinstance(refresh_token, str) or not refresh_token.strip():
-        return None
+def _remove_legacy_codex_profile() -> bool:
+    """Delete token copies created by older GAIA Codex OAuth integration."""
 
-    response = _post_oauth_token(
-        {
-            "grant_type": "refresh_token",
-            "client_id": OPENAI_OAUTH_CLIENT_ID,
-            "refresh_token": refresh_token.strip(),
-        }
-    )
-    access_token = response.get("access_token")
-    if not isinstance(access_token, str) or not access_token.strip():
-        return None
-
-    new_expires = _to_int(response.get("expires_in"))
-    source = str(profile.get("source") or "oauth").strip() or "oauth"
-    if not _is_oauth_source(source):
-        source = "oauth"
-    metadata_updates: dict[str, Any] = {
-        "source": source,
-        "oauth": True,
-        "updated_at": _now_iso(),
-        "issued_at": _now_iso(),
-        "scope": response.get("scope", metadata.get("scope")),
-        "token_type": response.get("token_type", "Bearer"),
-        "account_id": _decode_jwt_claim(access_token.strip(), "sub"),
-    }
-    if refresh_token_value := response.get("refresh_token"):
-        if isinstance(refresh_token_value, str) and refresh_token_value.strip():
-            metadata_updates["refresh_token"] = refresh_token_value.strip()
-    if new_expires:
-        metadata_updates["expires_at"] = _now_ts() + new_expires
-    if isinstance(response.get("refresh_token"), str) and response.get("refresh_token").strip():
-        metadata_updates["refresh_token"] = response.get("refresh_token").strip()
-
-    _save_provider_profile(
-        provider="openai",
-        token=access_token.strip(),
-        source=source,
-        metadata=metadata_updates,
-    )
-    return access_token.strip()
-
-
-def _build_openai_authorize_url(state: str, code_verifier: str) -> str:
-    code_challenge = _b64url(sha256(code_verifier.encode("utf-8")).digest())
-    params = {
-        "response_type": "code",
-        "client_id": OPENAI_OAUTH_CLIENT_ID,
-        "redirect_uri": OPENAI_OAUTH_REDIRECT_URI,
-        "scope": OPENAI_OAUTH_SCOPE,
-        "state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-        "id_token_add_organizations": "true",
-        "codex_cli_simplified_flow": "true",
-    }
-    return f"{OPENAI_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
-
-
-def _run_openai_callback_server(state: str, timeout: int = 90) -> dict[str, str | None] | None:
-    callback_data: dict[str, str | None] = {"code": None, "error": None, "state": None}
-    event = threading.Event()
-
-    class CallbackHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path != OPENAI_OAUTH_CALLBACK_PATH:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b"Not found")
-                return
-
-            query = parse_qs(parsed.query or "")
-            got_state = (query.get("state", [""])[0] or "").strip()
-            callback_data["state"] = got_state
-            callback_data["error"] = (query.get("error", [""])[0] or "").strip() or None
-
-            if got_state != state:
-                callback_data["error"] = "state_mismatch"
-            elif query.get("code"):
-                callback_data["code"] = query["code"][0].strip()
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            response_html = """<!doctype html>
-<html>
-  <body>
-    <h3>GAIA OpenAI 로그인</h3>
-    <p>브라우저 인증이 완료되었습니다. 터미널로 돌아가세요.</p>
-  </body>
-</html>"""
-            self.wfile.write(response_html.encode("utf-8"))
-            event.set()
-
-        def log_message(self, format: str, *args: Any) -> None:
-            return
-
-    try:
-        server = HTTPServer((OPENAI_OAUTH_CALLBACK_HOST, OPENAI_OAUTH_CALLBACK_PORT), CallbackHandler)
-    except OSError:
-        return None
-
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    event.wait(timeout)
-    server.shutdown()
-    server.server_close()
-    if thread.is_alive():
-        thread.join(1.0)
-
-    return callback_data
-
-
-def _prompt_redirect_input() -> str:
-    if not sys.stdin.isatty():
-        return ""
-    print("로그인 완료 후 브라우저 주소창의 전체 URL 또는 code 값을 붙여넣어 주세요.")
-    return input("입력: ").strip()
-
-
-def _exchange_openai_code(code: str, code_verifier: str) -> dict[str, Any]:
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": OPENAI_OAUTH_CLIENT_ID,
-        "code": code,
-        "redirect_uri": OPENAI_OAUTH_REDIRECT_URI,
-        "code_verifier": code_verifier,
-    }
-    data = _post_oauth_token(payload)
-    if not data.get("access_token"):
-        raise RuntimeError(f"토큰 응답에 access_token이 없습니다: {data}")
-    return data
+    payload = _load_profiles()
+    profile = payload.get("openai")
+    if not isinstance(profile, dict) or not _is_oauth_source(profile.get("source")):
+        return False
+    del payload["openai"]
+    _save_profiles(payload)
+    return True
 
 
 def get_stored_token(provider: str) -> str | None:
@@ -511,16 +280,8 @@ def get_stored_token(provider: str) -> str | None:
     if not isinstance(token, str) or not token.strip():
         return None
 
-    if _is_oauth_provider(provider) and _is_oauth_source(profile.get("source")):
-        if _is_oauth_token_expired(profile):
-            try:
-                refreshed = _refresh_openai_token(profile)
-            except Exception:
-                refreshed = None
-            if refreshed:
-                return refreshed
-            return None
-        return token.strip()
+    if provider == "openai" and _is_oauth_source(profile.get("source")):
+        return None
 
     return token.strip()
 
@@ -535,6 +296,11 @@ def get_token_source(provider: str) -> tuple[str | None, str | None]:
     env_token = os.getenv(env_key, "") if env_key else ""
     if env_token:
         return env_token, f"env:{env_key}"
+
+    if provider == "openai":
+        _remove_legacy_codex_profile()
+        if is_codex_cli_authenticated():
+            return CODEX_OAUTH_TOKEN_SENTINEL, CODEX_AUTH_SOURCE
 
     if provider == "ollama":
         return "ollama", "local:ollama"
@@ -583,216 +349,26 @@ def provider_login_url(provider: str) -> str:
     return PROVIDER_LOGIN_URL.get(provider, "")
 
 
-def _resolve_codex_home() -> Path:
-    raw_home = os.getenv("CODEX_HOME", str(Path.home() / ".codex"))
-    home = Path(raw_home).expanduser()
-    try:
-        return home.resolve()
-    except Exception:
-        return home
-
-
-def _resolve_codex_auth_path() -> Path:
-    return _resolve_codex_home() / "auth.json"
-
-
-def _compute_codex_keychain_account(codex_home: Path) -> str:
-    digest = sha256(str(codex_home).encode("utf-8")).hexdigest()
-    return f"cli|{digest[:16]}"
-
-
-def _parse_epoch_like(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        parsed = int(value)
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        if text.isdigit():
-            parsed = int(text)
-        else:
-            try:
-                parsed = int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
-            except Exception:
-                return None
-    else:
-        return None
-    if parsed > 10_000_000_000:
-        return parsed // 1000
-    return parsed
-
-
-def _extract_codex_tokens(payload: Any) -> dict[str, Any] | None:
-    if not isinstance(payload, dict):
-        return None
-    tokens = payload.get("tokens")
-    if not isinstance(tokens, dict):
-        return None
-
-    access = tokens.get("access_token")
-    refresh = tokens.get("refresh_token")
-    if not isinstance(access, str) or not access.strip():
-        return None
-    if not isinstance(refresh, str) or not refresh.strip():
-        return None
-
-    return {
-        "access_token": access.strip(),
-        "refresh_token": refresh.strip(),
-        "account_id": str(tokens.get("account_id")).strip() if tokens.get("account_id") else None,
-        "expires_at": _parse_epoch_like(tokens.get("expires_at")),
-        "last_refresh": _parse_epoch_like(payload.get("last_refresh")),
-    }
-
-
-def _read_codex_tokens_from_keychain() -> dict[str, Any] | None:
-    if sys.platform != "darwin":
-        return None
-
-    codex_home = _resolve_codex_home()
-    account = _compute_codex_keychain_account(codex_home)
-    try:
-        completed = subprocess.run(
-            [
-                "security",
-                "find-generic-password",
-                "-s",
-                CODEX_AUTH_SERVICE_NAME,
-                "-a",
-                account,
-                "-w",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except Exception:
-        return None
-
-    if completed.returncode != 0:
-        return None
-
-    try:
-        payload = json.loads((completed.stdout or "").strip())
-    except Exception:
-        return None
-
-    token_payload = _extract_codex_tokens(payload)
-    if not token_payload:
-        return None
-    if token_payload.get("expires_at") is None and token_payload.get("last_refresh"):
-        token_payload["expires_at"] = int(token_payload["last_refresh"]) + 3600
-    token_payload["source"] = "keychain"
-    token_payload["codex_home"] = str(codex_home)
-    return token_payload
-
-
-def _read_codex_tokens_from_auth_file() -> dict[str, Any] | None:
-    auth_path = _resolve_codex_auth_path()
-    if not auth_path.exists():
-        return None
-
-    try:
-        payload = json.loads(auth_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-    token_payload = _extract_codex_tokens(payload)
-    if not token_payload:
-        return None
-    if token_payload.get("expires_at") is None and token_payload.get("last_refresh"):
-        token_payload["expires_at"] = int(token_payload["last_refresh"]) + 3600
-    token_payload["source"] = "file"
-    token_payload["auth_path"] = str(auth_path)
-    return token_payload
-
-
-def _read_codex_tokens() -> dict[str, Any] | None:
-    keychain_tokens = _read_codex_tokens_from_keychain()
-    if keychain_tokens:
-        return keychain_tokens
-    return _read_codex_tokens_from_auth_file()
-
-
-def _persist_codex_openai_profile(token_payload: dict[str, Any]) -> str | None:
-    access = token_payload.get("access_token")
-    if not isinstance(access, str) or not access.strip():
-        return None
-
-    metadata: dict[str, Any] = {
-        "source": "oauth_codex_cli",
-        "oauth": True,
-        "issued_at": _now_iso(),
-        "token_type": "Bearer",
-        "account_id": token_payload.get("account_id"),
-        "refresh_token": token_payload.get("refresh_token"),
-        "codex_source": token_payload.get("source"),
-        "codex_home": token_payload.get("codex_home"),
-        "codex_auth_path": token_payload.get("auth_path"),
-    }
-    expires_at = _to_int(token_payload.get("expires_at"))
-    if expires_at:
-        metadata["expires_at"] = expires_at
-        if expires_at <= _now_ts() + 30:
-            try:
-                return _refresh_openai_token(
-                    {
-                        "source": "oauth_codex_cli",
-                        "token": access.strip(),
-                        "metadata": metadata,
-                    }
-                )
-            except Exception:
-                return None
-    _save_provider_profile("openai", access.strip(), source="oauth_codex_cli", metadata=metadata)
-    return access.strip()
-
-
-def _launch_codex_login(open_browser: bool = True) -> bool:
-    codex_bin = shutil.which("codex")
-    if not codex_bin:
-        print("Codex CLI가 필요합니다. `npm install -g @openai/codex` 설치 후 다시 시도하세요.")
-        return False
-    if not open_browser:
-        print("Codex CLI 로그인은 내부 브라우저/URL 플로우를 사용합니다.")
-    print("OpenAI OAuth를 위해 Codex CLI 로그인(`codex login`)을 시작합니다.")
-    try:
-        completed = subprocess.run([codex_bin, "login"], check=False)
-    except Exception as exc:
-        print(f"`codex login` 실행 실패: {exc}")
-        return False
-    if completed.returncode != 0:
-        print(f"`codex login`이 실패했습니다 (exit={completed.returncode}).")
-        return False
-    return True
-
-
 def _interactive_login_openai(open_browser: bool = True, force_reauth: bool = False) -> str | None:
-    if not force_reauth:
-        existing = _read_codex_tokens()
-        if existing:
-            token = _persist_codex_openai_profile(existing)
-            if token:
-                print("Codex CLI OAuth 토큰을 재사용합니다.")
-                return token
+    _remove_legacy_codex_profile()
+    if not force_reauth and is_codex_cli_authenticated():
+        print("Codex CLI OAuth 세션을 재사용합니다. 토큰은 GAIA로 복사하지 않습니다.")
+        return CODEX_OAUTH_TOKEN_SENTINEL
 
     if not sys.stdin.isatty():
         return None
 
-    if not _launch_codex_login(open_browser=open_browser):
+    if not codex_cli_path():
+        print("Codex CLI가 필요합니다. `npm install -g @openai/codex` 설치 후 다시 시도하세요.")
         return None
-
-    token_payload = _read_codex_tokens()
-    if not token_payload:
-        print("`codex login` 완료 후 토큰을 찾지 못했습니다. `codex login`을 직접 다시 실행해 주세요.")
+    if not open_browser:
+        print("Codex CLI 로그인은 자체 브라우저/URL 플로우를 사용합니다.")
+    print("OpenAI OAuth를 위해 공식 Codex CLI 로그인(`codex login`)을 시작합니다.")
+    if not run_codex_login():
+        print("`codex login`이 실패했거나 로그인 상태를 확인하지 못했습니다.")
         return None
-
-    token = _persist_codex_openai_profile(token_payload)
-    if token:
-        print("OpenAI OAuth(Codex) 인증이 완료되었습니다.")
-    return token
+    print("OpenAI OAuth(Codex) 인증이 완료되었습니다. 토큰은 Codex가 계속 관리합니다.")
+    return CODEX_OAUTH_TOKEN_SENTINEL
 
 
 def interactive_login(
@@ -950,6 +526,9 @@ def write_env_if_set(provider: str, token: str | None) -> None:
         _gemini_vertex_source(export=True)
         os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "true")
         return
+    if provider == "openai" and token == CODEX_OAUTH_TOKEN_SENTINEL:
+        os.environ["GAIA_OPENAI_AUTH_SOURCE"] = CODEX_AUTH_SOURCE
+        return
     if provider == "ollama" and not token:
         os.environ.setdefault(env_key, "ollama")
         return
@@ -964,7 +543,12 @@ def list_status() -> dict[str, dict[str, str]]:
     for provider, env_key in PROVIDER_ENV_MAP.items():
         token, source = get_token_source(provider)
         if token:
-            mask = "vertex-ai" if token == GEMINI_VERTEX_TOKEN_SENTINEL else mask_token(token)
+            if token == GEMINI_VERTEX_TOKEN_SENTINEL:
+                mask = "vertex-ai"
+            elif token == CODEX_OAUTH_TOKEN_SENTINEL:
+                mask = "codex-session"
+            else:
+                mask = mask_token(token)
             result[provider] = {
                 "status": "configured",
                 "mask": mask,
@@ -1034,7 +618,10 @@ def run_auth(argv: list[str] | None = None) -> int:
             print("토큰이 입력되지 않아 로그인에 실패했습니다.")
             return 1
         write_env_if_set(provider, token)
-        print(f"{provider} 인증 정보가 저장되었습니다.")
+        if token == CODEX_OAUTH_TOKEN_SENTINEL:
+            print("Codex OAuth 연결을 확인했습니다. GAIA에는 토큰을 저장하지 않았습니다.")
+        else:
+            print(f"{provider} 인증 정보가 저장되었습니다.")
         return 0
 
     if args.auth_command == "status":

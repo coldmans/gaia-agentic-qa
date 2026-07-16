@@ -47,6 +47,12 @@ from gaia.src.gui.battle_web_admin import (
     prepare_battle_session,
     reset_battle_timer,
 )
+from gaia.src.gui.presentation_logs import (
+    audience_log_line,
+    detect_log_level,
+    format_log_line_html,
+    strip_worker_log_prefix,
+)
 from gaia.src.screenshot_quality import is_low_information_screenshot
 
 
@@ -7247,12 +7253,7 @@ end tell
 
     def _detect_log_level(self, text: str) -> str:
         """메시지 텍스트에서 ERROR/WARN/INFO 레벨 추정 — append_log + 필터 공용."""
-        lower = text.lower()
-        if "❌" in text or "fail" in lower or "error" in lower or "오류" in text or "실패" in text:
-            return "ERROR"
-        if "⚠️" in text or "warn" in lower or "blocked" in lower or "차단" in text:
-            return "WARN"
-        return "INFO"
+        return detect_log_level(text)
 
     def _battle_audience_log_mode(self) -> bool:
         if getattr(self, "_selected_run_mode", "") == "battle_demo":
@@ -7262,137 +7263,19 @@ end tell
 
     @staticmethod
     def _strip_worker_log_prefix(text: str) -> str:
-        import re
-
-        return re.sub(r"^\d{2}:\d{2}:\d{2}(?:\.\d{3})?\s+(?:INFO|WARN|ERROR)\s+", "", text.strip())
+        return strip_worker_log_prefix(text)
 
     def _audience_log_line(self, message: str) -> tuple[str, str] | None:
         """Human vs GAIA 시연용으로 raw 로그를 관객 친화적인 한 줄로 줄인다."""
-        import re
-
-        text = self._strip_worker_log_prefix(str(message or ""))
-        lower = text.lower()
-        if not text:
-            return None
-
-        hidden_fragments = (
-            "schema_version",
-            "runner_id",
-            "runtime_policy",
-            "runtime_isolation",
-            "openclaw",
-            "base_url",
-            "json_path",
-            "html_path",
-            "llm_ms_",
-            "trace_metrics",
-            "kpi_metrics",
-            "status_counts",
-            "failures",
-            "blocked",
-            "coverage:",
-            "127.0.0.1",
-            "/users/",
-            "file://",
-            "cmd:",
-            "suite:",
-            "target:",
-            "metrics:",
-            "battle board:",
-            "human input:",
-            "warm runtime:",
-            "서버:",
-            "push →",
-            "[히스토리]",
-            "모니터링 서버",
-        )
-        if text.startswith(("{", "}", '"')) or any(fragment in lower for fragment in hidden_fragments):
-            return None
-        if text.startswith("--- Step"):
-            return None
-        if "시작 URL로 이동" in text:
-            return None
-
-        if "Human 타이머 시작:" in text:
-            return "Human 타이머 시작: " + text.split("Human 타이머 시작:", 1)[1].strip(), "INFO"
-        if "벤치 실행 시작:" in text:
-            return "GAIA 실행 시작: " + text.split("벤치 실행 시작:", 1)[1].strip(), "INFO"
-        if "🎯 목표 시작:" in text:
-            return "목표 시작: " + text.split("🎯 목표 시작:", 1)[1].strip(), "INFO"
-        if "목표 달성" in text:
-            reason = text.split("이유:", 1)[1].strip() if "이유:" in text else text.replace("✅", "").strip()
-            return f"목표 달성: {reason}", "SUCCESS"
-        if "battle_upload:" in text:
-            return "웹 증거 업로드: " + text.split("battle_upload:", 1)[1].strip(), "UPLOAD"
-        if "업로드 완료" in text:
-            return "웹 보드 업로드 완료", "UPLOAD"
-        if "[완료]" in text or "자동화 실행 완료" in text:
-            return "GAIA 실행 완료", "SUCCESS"
-
-        if "액션 실패" in text or "not_actionable" in lower or "not interactable" in lower:
-            if "covered" in lower or "intercepts pointer events" in lower:
-                return "가려진 UI 감지 -> 재탐색 후 재시도", "RECOVERY"
-            return "화면 상태 변경 감지 -> 대상 재탐색", "RECOVERY"
-        if "not found or not visible" in lower:
-            return "화면 상태 변경 감지 -> 최신 화면으로 재탐색", "RECOVERY"
-        if "phase 전환" in text:
-            return "전략 전환: 화면 수집 -> 실행", "RECOVERY"
-
-        decision_match = re.search(r"LLM 결정:\s*([a-z_]+)\s*-", text)
-        if decision_match:
-            action = decision_match.group(1)
-            action_labels = {
-                "click": "클릭 대상 선택",
-                "fill": "입력값 준비",
-                "type": "입력값 준비",
-                "press": "키 입력",
-                "scroll": "화면 이동",
-                "wait": "상태 안정화 확인",
-                "inspect": "화면 관찰",
-                "select": "옵션 선택",
-            }
-            return f"판단: {action_labels.get(action, action)}", "INFO"
-
-        case_match = re.search(r"\]\s+\d+/\d+\s+([A-Z0-9_]+)\s+\.\.\.", text)
-        if case_match:
-            return f"케이스 실행: {case_match.group(1)}", "INFO"
-
-        return None
+        return audience_log_line(message)
 
     def _format_log_line_html(self, message: str, ts: str | None = None) -> tuple[str, str]:
         """레벨 컬러 적용된 HTML 한 줄 + 추정된 레벨 반환."""
-        import html as _html
-        from datetime import datetime as _dt
-        if ts is None:
-            ts = _dt.now().strftime("%H:%M:%S.%f")[:-3]
-        text = str(message or "")
-        if self._battle_audience_log_mode():
-            audience_line = self._audience_log_line(text)
-            if audience_line is None:
-                return "", "HIDDEN"
-            text, level = audience_line
-        else:
-            level = self._detect_log_level(text)
-
-        if level == "ERROR":
-            level_color, msg_color = "#ef4444", "#fca5a5"
-        elif level == "WARN":
-            level_color, msg_color = "#f59e0b", "#fde68a"
-        elif level == "RECOVERY":
-            level_color, msg_color = "#38bdf8", "#bae6fd"
-        elif level == "UPLOAD":
-            level_color, msg_color = "#a78bfa", "#ddd6fe"
-        elif level == "SUCCESS" or "✅" in text or "success" in text.lower() or "pass" in text.lower() or "성공" in text or "달성" in text:
-            level_color, msg_color = "#1f9d6a", "#86efac"
-        else:
-            level_color, msg_color = "#1f9d6a", "#e2e8f0"
-        safe_text = _html.escape(text)
-        html_line = (
-            f'<span style="color:#94a3b8;">{ts}</span>  '
-            f'<span style="color:{level_color}; font-weight:700;">{level}</span>  '
-            f'<span style="color:{msg_color};">{safe_text}</span>'
+        return format_log_line_html(
+            message,
+            ts=ts,
+            audience_mode=self._battle_audience_log_mode(),
         )
-        return html_line, level
 
     def _log_level_filter_passes(self, line_level: str) -> bool:
         """현재 콤보 선택을 기준으로 해당 레벨을 표시할지 여부."""

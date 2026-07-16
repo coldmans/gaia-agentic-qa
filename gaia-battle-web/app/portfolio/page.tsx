@@ -9,7 +9,7 @@ export const metadata: Metadata = {
 
 const stats = [
   { label: "개발 기간", value: "2025-2026", detail: "초기 MCP 실험부터 live demo까지" },
-  { label: "대표 검증", value: "30/30", detail: "Human vs GAIA clean run success" },
+  { label: "최신 회귀", value: "26/30", detail: "0 agent FAIL · 4 external/time blockers" },
   { label: "검증 범위", value: "35 sites", detail: "173 public scenarios manifest" },
   { label: "핵심 구조", value: "4-layer", detail: "Actor, action, ledger, judge" },
 ];

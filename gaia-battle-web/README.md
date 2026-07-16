@@ -1,8 +1,10 @@
-# GAIA Battle Web
+# GAIA Portfolio and Battle Web
 
-Vercel 배포용 Human vs GAIA 점수판입니다. 발표장에서는 당일 고정 세션 `battle-live` 하나에 사람 QA와 GAIA 기록을 모읍니다.
+공개 포트폴리오와 Human vs GAIA 점수판을 함께 담은 Next.js 앱입니다. 루트 경로는 포트폴리오로 이동하고, 시연 기능은 `/battle` 아래에 유지됩니다.
 
-Production: `https://gaia-battle-web.vercel.app`
+Portfolio production: `https://gaia-agentic-qa.vercel.app`
+
+Legacy capstone demo: `https://gaia-battle-web.vercel.app`
 
 ## Local
 
@@ -11,6 +13,7 @@ npm install
 npm run dev
 ```
 
+- Portfolio: `http://localhost:3000/portfolio`
 - Scoreboard: `http://localhost:3000/battle/battle-live`
 - Human input: `http://localhost:3000/battle/battle-live/human`
 - Setup: `http://localhost:3000/battle/new`

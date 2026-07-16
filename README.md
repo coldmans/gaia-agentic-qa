@@ -50,6 +50,9 @@ gaia chat --gui --url https://example.com
 
 OpenAI authentication reuses the local Codex OAuth session by default. A
 manually supplied API key is an explicit fallback, not the primary setup path.
+GAIA only asks `codex login status` and delegates calls to Codex; it never reads
+or copies Codex access/refresh tokens. See
+[`docs/architecture/AUTHENTICATION.md`](docs/architecture/AUTHENTICATION.md).
 
 The packaged browser adapter installs its pinned npm dependencies on first
 run. Runtime state and browser profiles live under `~/.gaia/runtime`, outside
@@ -76,7 +79,7 @@ default install does not pull every integration.
 python scripts/run_goal_benchmark.py \
   --suite gaia/tests/scenarios/hacker_news_public_suite.json \
   --provider openai \
-  --model gpt-5.5
+  --model gpt-5.6-sol
 ```
 
 The benchmark output separates total duration, actor LLM time, judge LLM time,
@@ -86,6 +89,12 @@ WAIT/inspect decisions, recovery events, and blocked user actions. See
 The preserved capstone baseline was 30/30 successful scenarios with 76.5s
 average duration under a warm-process/cold-state policy. It is a defined-suite
 result, not a claim about every website.
+
+The 2026-07-16 public-manifest regression used GPT-5.6 Sol and produced 26
+SUCCESS, 4 deterministic external/time-dependent blockers, and 0 non-blocked
+agent failures. Mean duration was 66.45s. The four blocked scenarios reproduced
+the same conditions on a focused rerun; see
+[`docs/benchmarks/2026-07-16-gpt-5.6-sol-portfolio-30.md`](docs/benchmarks/2026-07-16-gpt-5.6-sol-portfolio-30.md).
 
 A scoped Hacker News A/B check (two successful runs per variant) reduced the
 actor prompt from 77,520 to 48,304 characters (-37.7%). Mean actor LLM latency
@@ -119,6 +128,8 @@ The detailed problem, architecture, debugging stories, failures, and lessons
 are in [`docs/portfolio/GAIA_PORTFOLIO_CASE_STUDY.md`](docs/portfolio/GAIA_PORTFOLIO_CASE_STUDY.md).
 The responsive portfolio page is served from `/portfolio` by the included
 Next.js app.
+
+Live portfolio: <https://gaia-agentic-qa.vercel.app/portfolio>
 
 ## Safety boundary
 
