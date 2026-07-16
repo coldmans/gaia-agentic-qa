@@ -50,6 +50,9 @@ gaia chat --gui --url https://example.com
 
 OpenAI authentication reuses the local Codex OAuth session by default. A
 manually supplied API key is an explicit fallback, not the primary setup path.
+GAIA only asks `codex login status` and delegates calls to Codex; it never reads
+or copies Codex access/refresh tokens. See
+[`docs/architecture/AUTHENTICATION.md`](docs/architecture/AUTHENTICATION.md).
 
 The packaged browser adapter installs its pinned npm dependencies on first
 run. Runtime state and browser profiles live under `~/.gaia/runtime`, outside

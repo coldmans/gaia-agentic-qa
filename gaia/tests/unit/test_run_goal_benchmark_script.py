@@ -219,16 +219,8 @@ def test_provider_credential_error_reports_incomplete_gemini_vertex_env() -> Non
     assert "Vertex AI requires" in _provider_credential_error("gemini", env)
 
 
-def test_provider_credential_error_accepts_codex_cli_auth(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    auth_dir = tmp_path / ".codex"
-    auth_dir.mkdir()
-    (auth_dir / "auth.json").write_text(
-        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "redacted"}}),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr("scripts.run_goal_benchmark.Path.home", lambda: tmp_path)
-    monkeypatch.setattr("scripts.run_goal_benchmark.shutil.which", lambda name: "/opt/homebrew/bin/codex" if name == "codex" else None)
+def test_provider_credential_error_accepts_codex_cli_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("scripts.run_goal_benchmark.is_codex_cli_authenticated", lambda: True)
 
     assert _provider_credential_error("openai", {}) == ""
 

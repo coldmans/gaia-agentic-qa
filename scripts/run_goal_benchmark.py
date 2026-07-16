@@ -8,7 +8,6 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import statistics
 import subprocess
 import sys
@@ -39,6 +38,7 @@ from scripts.benchmark_blocking import (
     summary_reason_code_summary,
 )
 from scripts.runner_identity import resolve_runner_id
+from gaia.codex_auth import is_codex_cli_authenticated
 from gaia.src.battle_board import write_battle_board
 from gaia.harness.benchmark_policy import apply_benchmark_success_policy
 
@@ -859,21 +859,15 @@ def _load_gaia_profile_token(provider: str) -> str:
     except Exception:
         return ""
     profile = raw.get(provider, {}) if isinstance(raw, dict) else {}
+    source = str(profile.get("source") or "").strip().lower() if isinstance(profile, dict) else ""
+    if source.startswith("oauth"):
+        return ""
     token = profile.get("token") if isinstance(profile, dict) else ""
     return str(token or "").strip()
 
 
 def _has_codex_cli_auth() -> bool:
-    if shutil.which("codex") is None:
-        return False
-    auth_path = Path.home() / ".codex" / "auth.json"
-    try:
-        raw = json.loads(auth_path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    if not isinstance(raw, dict):
-        return False
-    return any(str(raw.get(key) or "").strip() for key in ("OPENAI_API_KEY", "auth_mode")) or bool(raw.get("tokens"))
+    return is_codex_cli_authenticated()
 
 
 def _populate_provider_credentials(env: Dict[str, str], provider: str) -> None:
@@ -935,7 +929,7 @@ def _provider_credential_error(provider: str, env: Dict[str, str]) -> str:
             return ""
         return (
             "missing_provider_credentials: provider=openai requires OPENAI_API_KEY or OPENAI_ADMIN_KEY. "
-            "Set it in the shell environment, repo .env, ~/.gaia/auth/profiles.json, or run `codex login` "
+            "Set it explicitly for direct API mode, or run `codex login` "
             "on this machine before running benchmarks."
         )
     if normalized == "gemini" and not str(env.get("GEMINI_API_KEY") or "").strip():

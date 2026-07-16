@@ -11,12 +11,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Dict, List
 
 import openai
 
+from gaia.codex_auth import (
+    CODEX_AUTH_SOURCE,
+    CODEX_OAUTH_TOKEN_SENTINEL,
+    is_codex_cli_authenticated,
+)
 from gaia.src.phase4.codex_app_server_client import CodexAppServerClient, CodexAppServerError
 from gaia.src.utils.models import DomElement
 
@@ -61,14 +65,8 @@ class LLMVisionClient:
             return None
         profile = raw.get(provider, {}) if isinstance(raw, dict) else {}
         source = str(profile.get("source") or "").strip().lower()
-        metadata = profile.get("metadata")
-        if source.startswith("oauth") and isinstance(metadata, dict):
-            try:
-                expires_at = int(metadata.get("expires_at") or 0)
-            except Exception:
-                expires_at = 0
-            if expires_at and expires_at <= int(time.time()) + 30:
-                return None
+        if source.startswith("oauth"):
+            return None
         token = profile.get("token")
         if isinstance(token, str) and token.strip():
             return token.strip()
@@ -76,30 +74,7 @@ class LLMVisionClient:
 
     @staticmethod
     def _has_codex_cli_auth() -> bool:
-        if shutil.which("codex") is None:
-            return False
-        auth_path = Path.home() / ".codex" / "auth.json"
-        try:
-            raw = json.loads(auth_path.read_text(encoding="utf-8"))
-        except Exception:
-            return False
-        if not isinstance(raw, dict):
-            return False
-        return any(str(raw.get(key) or "").strip() for key in ("OPENAI_API_KEY", "auth_mode")) or bool(raw.get("tokens"))
-
-    @staticmethod
-    def _load_openai_key_from_codex_auth() -> str | None:
-        """~/.codex/auth.json에서 OPENAI_API_KEY 추출 (codex CLI가 ChatGPT 로그인으로
-        받아온 키). codex CLI가 깨졌을 때 OpenAI API 직접 호출용 fallback으로 사용."""
-        auth_path = Path.home() / ".codex" / "auth.json"
-        try:
-            raw = json.loads(auth_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        if not isinstance(raw, dict):
-            return None
-        key = str(raw.get("OPENAI_API_KEY") or "").strip()
-        return key or None
+        return is_codex_cli_authenticated()
 
     @staticmethod
     def _read_local_env_file_assignments() -> dict[str, str]:
@@ -143,6 +118,10 @@ class LLMVisionClient:
         model_env = str(provider_config.get("model_env") or "")
         dotenv_assignments = self._read_local_env_file_assignments()
 
+        codex_auth_requested = api_key == CODEX_OAUTH_TOKEN_SENTINEL
+        if codex_auth_requested:
+            api_key = None
+
         if api_key is None:
             api_key = os.getenv(env_key)
             if api_key is None:
@@ -151,12 +130,6 @@ class LLMVisionClient:
                     os.environ[env_key] = api_key
             if api_key is None:
                 api_key = self._load_profile_token(self.provider)
-                if api_key:
-                    os.environ[env_key] = api_key
-            # OpenAI provider이고 위에서 아무것도 못 찾았으면 ~/.codex/auth.json에서 추출
-            # (codex CLI ChatGPT 로그인 사용 사용자가 codex가 broken일 때 fallback)
-            if api_key is None and self.provider == "openai":
-                api_key = self._load_openai_key_from_codex_auth()
                 if api_key:
                     os.environ[env_key] = api_key
         if self.provider == "ollama" and not api_key:
@@ -184,11 +157,12 @@ class LLMVisionClient:
         self.reasoning_effort = str(
             reasoning_effort if reasoning_effort is not None else os.getenv("GAIA_CODEX_REASONING_EFFORT", "")
         ).strip().lower()
-        self._auth_source = self._load_auth_source(self.provider)
+        self._auth_source = CODEX_AUTH_SOURCE if codex_auth_requested else self._load_auth_source(self.provider)
         model_prefers_codex = "codex" in self.model.lower()
         codex_cli_auth_available = self._has_codex_cli_auth()
         self._prefer_codex_cli = (
             self.provider == "openai"
+            and codex_cli_auth_available
             and (self._auth_source.startswith("oauth_codex_cli") or model_prefers_codex or (not api_key and codex_cli_auth_available))
             and shutil.which("codex") is not None
         )

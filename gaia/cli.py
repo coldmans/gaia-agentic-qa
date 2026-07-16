@@ -673,6 +673,8 @@ def _resolve_account_model_choices(provider: str, token: str | None) -> list[str
         return []
     if provider == "gemini" and token == getattr(gaia_auth, "GEMINI_VERTEX_TOKEN_SENTINEL", ""):
         return []
+    if provider == "openai" and token == getattr(gaia_auth, "CODEX_OAUTH_TOKEN_SENTINEL", ""):
+        return []
     if provider == "openai":
         return _fetch_openai_models(token)
     if provider == "gemini":

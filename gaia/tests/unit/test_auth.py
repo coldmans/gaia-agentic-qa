@@ -74,84 +74,77 @@ def test_get_token_source_accepts_gemini_vertex_env_file(tmp_path, monkeypatch) 
     assert gaia_auth.os.environ["GOOGLE_APPLICATION_CREDENTIALS"] == str(credentials)
 
 
-def test_get_token_source_refreshes_expired_codex_oauth_profile(tmp_path, monkeypatch) -> None:
+def test_get_token_source_uses_codex_status_without_copying_tokens(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(gaia_auth, "AUTH_DIR", tmp_path / "auth")
     monkeypatch.setattr(gaia_auth, "AUTH_FILE", tmp_path / "auth" / "profiles.json")
-    monkeypatch.setattr(gaia_auth, "_now_ts", lambda: 1000)
+    monkeypatch.setattr(gaia_auth, "is_codex_cli_authenticated", lambda: True)
     gaia_auth.AUTH_DIR.mkdir(parents=True)
     gaia_auth.AUTH_FILE.write_text(
         json.dumps(
             {
                 "openai": {
                     "provider": "openai",
-                    "token": "expired-token",
+                    "token": "legacy-access-token",
                     "source": "oauth_codex_cli",
                     "updated_at": "2026-05-18T00:00:00Z",
                     "metadata": {
-                        "expires_at": 1001,
-                        "refresh_token": "refresh-token",
+                        "refresh_token": "legacy-refresh-token",
                     },
                 }
             }
         ),
         encoding="utf-8",
-    )
-
-    monkeypatch.setattr(
-        gaia_auth,
-        "_post_oauth_token",
-        lambda payload: {
-            "access_token": "fresh-token",
-            "expires_in": 3600,
-            "refresh_token": "new-refresh-token",
-            "token_type": "Bearer",
-        },
     )
 
     token, source = gaia_auth.get_token_source("openai")
 
-    assert token == "fresh-token"
-    assert source == "oauth_codex_cli"
+    assert token == gaia_auth.CODEX_OAUTH_TOKEN_SENTINEL
+    assert source == gaia_auth.CODEX_AUTH_SOURCE
     saved = json.loads(gaia_auth.AUTH_FILE.read_text(encoding="utf-8"))
-    assert saved["openai"]["token"] == "fresh-token"
-    assert saved["openai"]["source"] == "oauth_codex_cli"
-    assert saved["openai"]["metadata"]["refresh_token"] == "new-refresh-token"
+    assert "openai" not in saved
+    assert "legacy-access-token" not in gaia_auth.AUTH_FILE.read_text(encoding="utf-8")
+    assert "legacy-refresh-token" not in gaia_auth.AUTH_FILE.read_text(encoding="utf-8")
 
 
-def test_get_token_source_does_not_return_expired_codex_oauth_when_refresh_fails(tmp_path, monkeypatch) -> None:
+def test_get_token_source_removes_legacy_codex_profile_when_cli_is_logged_out(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(gaia_auth, "AUTH_DIR", tmp_path / "auth")
     monkeypatch.setattr(gaia_auth, "AUTH_FILE", tmp_path / "auth" / "profiles.json")
-    monkeypatch.setattr(gaia_auth, "_now_ts", lambda: 1000)
+    monkeypatch.setattr(gaia_auth, "is_codex_cli_authenticated", lambda: False)
     gaia_auth.AUTH_DIR.mkdir(parents=True)
     gaia_auth.AUTH_FILE.write_text(
         json.dumps(
             {
                 "openai": {
                     "provider": "openai",
-                    "token": "expired-token",
+                    "token": "legacy-access-token",
                     "source": "oauth_codex_cli",
                     "updated_at": "2026-05-18T00:00:00Z",
                     "metadata": {
-                        "expires_at": 1001,
-                        "refresh_token": "refresh-token",
+                        "refresh_token": "legacy-refresh-token",
                     },
                 }
             }
         ),
         encoding="utf-8",
     )
-
-    def fail_refresh(_payload):
-        raise RuntimeError("refresh failed")
-
-    monkeypatch.setattr(gaia_auth, "_post_oauth_token", fail_refresh)
 
     token, source = gaia_auth.get_token_source("openai")
 
     assert token is None
     assert source is None
+    assert json.loads(gaia_auth.AUTH_FILE.read_text(encoding="utf-8")) == {}
+
+
+def test_codex_sentinel_is_never_exported_as_openai_api_key(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GAIA_OPENAI_AUTH_SOURCE", raising=False)
+
+    gaia_auth.write_env_if_set("openai", gaia_auth.CODEX_OAUTH_TOKEN_SENTINEL)
+
+    assert "OPENAI_API_KEY" not in gaia_auth.os.environ
+    assert gaia_auth.os.environ["GAIA_OPENAI_AUTH_SOURCE"] == gaia_auth.CODEX_AUTH_SOURCE
 
 
 def test_interactive_login_gemini_writes_env_file_and_profile(tmp_path, monkeypatch) -> None:

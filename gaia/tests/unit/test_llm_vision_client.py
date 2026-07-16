@@ -44,18 +44,12 @@ def test_get_vision_client_returns_openai_compatible_client_for_ollama(monkeypat
 
 
 def test_openai_client_uses_codex_cli_auth_without_api_key(monkeypatch, tmp_path) -> None:
-    auth_dir = tmp_path / ".codex"
-    auth_dir.mkdir()
-    (auth_dir / "auth.json").write_text(
-        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "redacted"}}),
-        encoding="utf-8",
-    )
-
     def fail_openai_init(**_kwargs):
         raise AssertionError("OpenAI client should not be initialized for Codex CLI auth")
 
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.Path.home", lambda: tmp_path)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.shutil.which", lambda name: "/opt/homebrew/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr("gaia.src.phase4.llm_vision_client.is_codex_cli_authenticated", lambda: True)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.openai.OpenAI", fail_openai_init)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.LLMVisionClient._read_local_env_file_assignments", staticmethod(lambda: {}))
     monkeypatch.setenv("GAIA_LLM_PROVIDER", "openai")
@@ -72,18 +66,12 @@ def test_openai_client_uses_codex_cli_auth_without_api_key(monkeypatch, tmp_path
 
 
 def test_codex_app_server_can_be_disabled_for_cli_auth(monkeypatch, tmp_path) -> None:
-    auth_dir = tmp_path / ".codex"
-    auth_dir.mkdir()
-    (auth_dir / "auth.json").write_text(
-        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "redacted"}}),
-        encoding="utf-8",
-    )
-
     def fail_openai_init(**_kwargs):
         raise AssertionError("OpenAI client should not be initialized for Codex CLI auth")
 
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.Path.home", lambda: tmp_path)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.shutil.which", lambda name: "/opt/homebrew/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr("gaia.src.phase4.llm_vision_client.is_codex_cli_authenticated", lambda: True)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.openai.OpenAI", fail_openai_init)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.LLMVisionClient._read_local_env_file_assignments", staticmethod(lambda: {}))
     monkeypatch.setenv("GAIA_LLM_PROVIDER", "openai")
@@ -133,7 +121,7 @@ def test_codex_transport_falls_back_to_exec_when_app_server_fails(monkeypatch) -
     assert client._prefer_codex_app_server is False
 
 
-def test_openai_profile_loader_skips_expired_codex_oauth_token(monkeypatch, tmp_path) -> None:
+def test_openai_profile_loader_never_reuses_legacy_codex_oauth_token(monkeypatch, tmp_path) -> None:
     auth_dir = tmp_path / ".gaia" / "auth"
     auth_dir.mkdir(parents=True)
     (auth_dir / "profiles.json").write_text(
@@ -161,6 +149,7 @@ def test_openai_profile_loader_skips_expired_codex_oauth_token(monkeypatch, tmp_
 
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.Path.home", lambda: tmp_path)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.shutil.which", lambda _name: None)
+    monkeypatch.setattr("gaia.src.phase4.llm_vision_client.is_codex_cli_authenticated", lambda: False)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.openai.OpenAI", _FakeOpenAI)
     monkeypatch.setattr("gaia.src.phase4.llm_vision_client.LLMVisionClient._read_local_env_file_assignments", staticmethod(lambda: {}))
     monkeypatch.setenv("GAIA_LLM_PROVIDER", "openai")
