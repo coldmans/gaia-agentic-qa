@@ -21,6 +21,7 @@ node_modules/
 *.tsbuildinfo
 playwright-report/
 test-results/
+.playwright-cli/
 
 artifacts/
 output/
