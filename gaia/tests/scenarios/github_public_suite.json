@@ -1,0 +1,82 @@
+{
+  "suite_id": "github_public_v2",
+  "site": {
+    "name": "GitHub",
+    "base_url": "https://github.com/",
+    "mode": "public_readonly"
+  },
+  "grader_configs": {
+    "reason_codes": {
+      "forbidden_reason_codes": [
+        "user_intervention_missing"
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "GITHUB_001_HOME_NAV",
+      "name": "개발 플랫폼 주요 영역 확인",
+      "url": "https://github.com/",
+      "goal": "GitHub 공개 홈에서 저장소 탐색으로 이어지는 검색 입력, 제품 내비게이션, 공개 소개 영역 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "GITHUB_002_REPO_SEARCH",
+      "name": "저장소 검색 결과 확인",
+      "url": "https://github.com/search?q=python+cpython&type=repositories",
+      "goal": "GitHub 저장소 검색 결과에서 python cpython 관련 공개 저장소 목록과 정렬 또는 필터 영역을 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "GITHUB_003_REPO_OVERVIEW",
+      "name": "프로젝트 상세 확인",
+      "url": "https://github.com/python/cpython",
+      "goal": "python/cpython 저장소에서 파일 목록, README, 별표 수나 브랜치 표시처럼 프로젝트 현황 정보를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "GITHUB_004_ISSUE_TRIAGE",
+      "name": "이슈 목록 확인",
+      "url": "https://github.com/python/cpython/issues",
+      "goal": "python/cpython 이슈 목록에서 상태 필터, 이슈 제목 목록, 라벨 영역 중 확인 가능한 항목을 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "GITHUB_005_RELEASE_REVIEW",
+      "name": "릴리스 정보 확인",
+      "url": "https://github.com/python/cpython/releases",
+      "goal": "python/cpython 릴리스 화면에서 최신 릴리스 제목, 태그, 변경 요약 중 확인 가능한 정보를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    }
+  ]
+}

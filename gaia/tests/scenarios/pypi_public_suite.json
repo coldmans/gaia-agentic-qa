@@ -1,0 +1,82 @@
+{
+  "suite_id": "pypi_public_v2",
+  "site": {
+    "name": "PyPI",
+    "base_url": "https://pypi.org/",
+    "mode": "public_readonly"
+  },
+  "grader_configs": {
+    "reason_codes": {
+      "forbidden_reason_codes": [
+        "user_intervention_missing"
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "PYPI_001_HOME_SEARCH",
+      "name": "패키지 허브 주요 영역 확인",
+      "url": "https://pypi.org/",
+      "goal": "PyPI 공개 홈에서 패키지 검색 입력과 프로젝트 통계 또는 주요 안내 영역을 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "PYPI_002_PACKAGE_SEARCH",
+      "name": "패키지 파일 목록 확인",
+      "url": "https://pypi.org/project/requests/#files",
+      "goal": "requests 프로젝트의 파일 목록 영역에서 wheel, source distribution, 파일명, 크기 또는 등록 날짜 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "PYPI_003_PACKAGE_DETAIL",
+      "name": "패키지 상세 확인",
+      "url": "https://pypi.org/project/requests/",
+      "goal": "requests 프로젝트 화면에서 설치 명령, 최신 버전, 프로젝트 설명 또는 메타데이터를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "PYPI_004_RELEASE_HISTORY",
+      "name": "버전 이력 확인",
+      "url": "https://pypi.org/project/requests/#history",
+      "goal": "requests 프로젝트의 release history 영역에서 여러 버전 항목이나 릴리스 날짜가 보이는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "PYPI_005_PROJECT_LINKS",
+      "name": "프로젝트 링크 확인",
+      "url": "https://pypi.org/project/requests/",
+      "goal": "requests 프로젝트 화면의 Project links나 Meta 영역을 열람해 홈페이지, 이슈, 라이선스 같은 보조 정보를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    }
+  ]
+}

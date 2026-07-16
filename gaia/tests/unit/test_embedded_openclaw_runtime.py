@@ -1,0 +1,398 @@
+from __future__ import annotations
+
+import signal
+from pathlib import Path
+
+from gaia.src.phase4 import embedded_openclaw_runtime as runtime
+
+
+def test_build_embedded_openclaw_config_defaults_to_local_unauthenticated_browser() -> None:
+    config = runtime.build_embedded_openclaw_config(
+        gateway_port=18789,
+        cdp_port=18800,
+        browser_executable="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    )
+
+    assert config["gateway"]["mode"] == "local"
+    assert config["gateway"]["auth"]["mode"] == "none"
+    assert config["browser"]["enabled"] is True
+    assert config["browser"]["headless"] is False
+    assert config["browser"]["defaultProfile"] == "openclaw"
+    assert config["browser"]["profiles"]["openclaw"]["cdpPort"] == 18800
+    assert config["browser"]["executablePath"].endswith("Google Chrome")
+    assert "--no-startup-window" in config["browser"]["extraArgs"]
+
+
+def test_embedded_browser_server_entrypoint_uses_event_loop_keepalive() -> None:
+    bundle = runtime.runtime_vendor_root() / "gaia-embedded-browser-server.bundle.mjs"
+    text = bundle.read_text(encoding="utf-8")
+    assert "await new Promise(() =>" not in text
+    assert "setInterval" in text
+    assert "process.once(signal, resolve)" in text
+
+
+def test_openclaw_chrome_launch_uses_mock_keychain() -> None:
+    bundle = runtime.runtime_vendor_root() / "gaia-embedded-browser-server.bundle.mjs"
+    text = bundle.read_text(encoding="utf-8")
+    assert "--password-store=basic" in text
+    assert "--use-mock-keychain" in text
+
+
+def test_browser_server_ready_uses_lightweight_profiles_route(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {"profiles": [{"name": "openclaw"}]}
+
+    def _fake_get(url: str, **kwargs) -> _Response:
+        calls.append(url)
+        assert kwargs["timeout"] == 1.5
+        return _Response()
+
+    monkeypatch.setattr(runtime.requests, "get", _fake_get)
+
+    assert runtime._browser_server_ready("http://127.0.0.1:18791") is True
+    assert calls == ["http://127.0.0.1:18791/profiles"]
+
+
+def test_browser_server_ready_rejects_missing_openclaw_profile(monkeypatch) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {"profiles": [{"name": "user"}]}
+
+    monkeypatch.setattr(runtime.requests, "get", lambda *args, **kwargs: _Response())
+
+    assert runtime._browser_server_ready("http://127.0.0.1:18791") is False
+
+
+def test_build_embedded_openclaw_config_respects_headless_override(monkeypatch) -> None:
+    monkeypatch.setenv("GAIA_OPENCLAW_HEADLESS", "1")
+
+    config = runtime.build_embedded_openclaw_config(
+        gateway_port=18789,
+        cdp_port=18800,
+        browser_executable="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    )
+
+    assert config["browser"]["headless"] is True
+
+
+def test_detect_browser_executable_prefers_env_override(monkeypatch, tmp_path) -> None:
+    browser = tmp_path / "chrome"
+    browser.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GAIA_OPENCLAW_BROWSER_EXECUTABLE", str(browser))
+
+    assert runtime.detect_browser_executable() == str(browser)
+
+
+def test_detect_browser_executable_prefers_playwright_chromium(monkeypatch, tmp_path) -> None:
+    cache_dir = tmp_path / "ms-playwright"
+    old_browser = cache_dir / "chromium-1187" / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS"
+    old_browser.mkdir(parents=True)
+    (old_browser / "Chromium").write_text("", encoding="utf-8")
+    new_browser = cache_dir / "chromium-1208" / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS"
+    new_browser.mkdir(parents=True)
+    (new_browser / "Chromium").write_text("", encoding="utf-8")
+    chrome_for_testing = (
+        cache_dir
+        / "chromium-1223"
+        / "chrome-mac-arm64"
+        / "Google Chrome for Testing.app"
+        / "Contents"
+        / "MacOS"
+    )
+    chrome_for_testing.mkdir(parents=True)
+    (chrome_for_testing / "Google Chrome for Testing").write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("GAIA_OPENCLAW_BROWSER_EXECUTABLE", raising=False)
+    monkeypatch.setattr(runtime, "_PLAYWRIGHT_CACHE_DIR_CANDIDATES", (cache_dir,))
+    monkeypatch.setattr(
+        runtime,
+        "_CHROME_EXECUTABLE_CANDIDATES",
+        ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",),
+    )
+
+    assert runtime.detect_browser_executable() == str(chrome_for_testing / "Google Chrome for Testing")
+
+
+def test_detect_browser_executable_includes_common_windows_install_paths(monkeypatch, tmp_path) -> None:
+    local_app_data = tmp_path / "AppData" / "Local"
+    chrome = local_app_data / "Google" / "Chrome" / "Application" / "chrome.exe"
+    chrome.parent.mkdir(parents=True)
+    chrome.write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("GAIA_OPENCLAW_BROWSER_EXECUTABLE", raising=False)
+    monkeypatch.setattr(runtime, "_detect_playwright_chromium_executable", lambda: None)
+    monkeypatch.setattr(runtime, "_is_windows", lambda: True)
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.delenv("PROGRAMFILES", raising=False)
+    monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
+    monkeypatch.delenv("ProgramW6432", raising=False)
+
+    assert runtime.detect_browser_executable() == str(chrome)
+
+
+def test_probe_existing_browser_server_returns_ready_control_port(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "_PORT_CANDIDATES", ((18789, 18791, 18800), (19001, 19003, 19012)))
+    monkeypatch.setattr(
+        runtime,
+        "_browser_server_ready",
+        lambda base_url: base_url == "http://127.0.0.1:18791",
+    )
+
+    assert runtime._probe_existing_browser_server() == ("http://127.0.0.1:18791", 18789, 18791, 18800)
+
+
+def test_cleanup_stale_browser_profile_removes_singleton_lock(monkeypatch, tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    user_data_dir = state_dir / "browser" / "openclaw" / "user-data"
+    user_data_dir.mkdir(parents=True)
+    singleton_lock = user_data_dir / "SingletonLock"
+    singleton_lock.write_text("", encoding="utf-8")
+    calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(runtime, "_state_dir", lambda: state_dir)
+    monkeypatch.setattr(runtime.subprocess, "check_output", lambda *args, **kwargs: "111\n")
+
+    def _fake_kill(pid: int, sig: int) -> None:
+        calls.append((pid, sig))
+        if sig == 0:
+            return
+
+    monkeypatch.setattr(runtime.os, "kill", _fake_kill)
+
+    runtime._cleanup_stale_browser_profile()
+
+    assert (111, signal.SIGTERM) in calls
+    assert not singleton_lock.exists()
+
+
+def test_cleanup_stale_browser_profile_uses_windows_taskkill(monkeypatch, tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    user_data_dir = state_dir / "browser" / "openclaw" / "user-data"
+    user_data_dir.mkdir(parents=True)
+    singleton_lock = user_data_dir / "SingletonLock"
+    singleton_lock.write_text("", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(runtime, "_state_dir", lambda: state_dir)
+    monkeypatch.setattr(runtime, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime, "_stale_profile_process_ids", lambda _user_data_dir: [222])
+    monkeypatch.setattr(runtime, "_pid_is_alive", lambda pid: True)
+
+    def _fake_run(command, **kwargs):
+        commands.append(list(command))
+        class _Result:
+            returncode = 0
+        return _Result()
+
+    monkeypatch.setattr(runtime.subprocess, "run", _fake_run)
+
+    runtime._cleanup_stale_browser_profile()
+
+    assert ["taskkill", "/PID", "222", "/T"] in commands
+    assert ["taskkill", "/F", "/PID", "222", "/T"] in commands
+    assert not singleton_lock.exists()
+
+
+def test_bootstrap_env_sets_openclaw_config_dir(monkeypatch, tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(runtime, "_state_dir", lambda: state_dir)
+
+    env = runtime._bootstrap_env(gateway_port=18789, config_path=tmp_path / "openclaw.json")
+
+    assert env["OPENCLAW_CONFIG_DIR"] == str(state_dir)
+    assert env["OPENCLAW_STATE_DIR"] == str(state_dir)
+    assert "OPENCLAW_BUNDLED_PLUGINS_DIR" not in env
+
+
+def test_runtime_vendor_root_prefers_packaged_assets(monkeypatch) -> None:
+    monkeypatch.delenv("GAIA_OPENCLAW_RUNTIME_DIR", raising=False)
+
+    assert runtime.runtime_vendor_root() == runtime._package_root() / "_runtime" / "openclaw"
+
+
+def test_runtime_root_defaults_to_user_state_directory(monkeypatch) -> None:
+    monkeypatch.delenv("GAIA_RUNTIME_STATE_DIR", raising=False)
+
+    assert runtime.runtime_root() == Path.home() / ".gaia" / "runtime" / "embedded_openclaw"
+
+
+def test_prepare_runtime_package_copies_assets_outside_installed_package(monkeypatch, tmp_path) -> None:
+    source = tmp_path / "assets"
+    destination = tmp_path / "state" / "package"
+    source.mkdir()
+    for name in runtime._RUNTIME_PACKAGE_FILES:
+        (source / name).write_text(f"asset:{name}\n", encoding="utf-8")
+    monkeypatch.setattr(runtime, "runtime_vendor_root", lambda: source)
+    monkeypatch.setattr(runtime, "runtime_install_root", lambda: destination)
+
+    prepared = runtime._prepare_runtime_package()
+
+    assert prepared == destination
+    assert (destination / "gaia-embedded-browser-server.bundle.mjs").read_text(encoding="utf-8").startswith("asset:")
+    assert not (source / "node_modules").exists()
+
+
+def test_node_modules_require_matching_lock_stamp(tmp_path) -> None:
+    root = tmp_path / "runtime"
+    for name in ("playwright-core", "sharp", "ajv", "ajv-formats"):
+        (root / "node_modules" / name).mkdir(parents=True)
+    (root / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+
+    assert runtime._node_modules_present(root) is False
+
+    (root / runtime._RUNTIME_LOCK_STAMP).write_text(runtime._runtime_lock_digest(root) + "\n", encoding="utf-8")
+    assert runtime._node_modules_present(root) is True
+
+    (root / "package-lock.json").write_text('{"lockfileVersion": 4}\n', encoding="utf-8")
+    assert runtime._node_modules_present(root) is False
+
+
+def test_embedded_server_popen_kwargs_use_start_new_session_on_posix(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "_is_windows", lambda: False)
+
+    assert runtime._embedded_server_popen_kwargs() == {"start_new_session": True}
+
+
+def test_embedded_server_popen_kwargs_use_creationflags_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(runtime, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime.subprocess, "CREATE_NEW_PROCESS_GROUP", 512, raising=False)
+    monkeypatch.setattr(runtime.subprocess, "CREATE_NO_WINDOW", 134217728, raising=False)
+
+    payload = runtime._embedded_server_popen_kwargs()
+
+    assert "creationflags" in payload
+    assert int(payload["creationflags"]) == 512 + 134217728
+
+
+def test_ensure_browser_profile_started_raises_on_error(monkeypatch) -> None:
+    class _Response:
+        status_code = 500
+        text = 'Error: Failed to start Chrome CDP on port 18800 for profile "openclaw".'
+
+        def json(self) -> dict[str, str]:
+            return {"error": self.text}
+
+    monkeypatch.setattr(runtime.requests, "post", lambda *args, **kwargs: _Response())
+    monkeypatch.setattr(runtime, "_browser_profile_ready", lambda *args, **kwargs: False)
+    monkeypatch.setattr(runtime, "_cleanup_stale_browser_profile", lambda: None)
+    monkeypatch.setattr(runtime.time, "sleep", lambda _: None)
+
+    try:
+        runtime._ensure_browser_profile_started("http://127.0.0.1:18791")
+    except RuntimeError as exc:
+        assert "Failed to start Chrome CDP" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError when /start returns failure")
+
+
+def test_ensure_browser_profile_started_retries_transient_start_failure(monkeypatch) -> None:
+    class _Response:
+        def __init__(self, status_code: int, payload: dict[str, object], text: str = "") -> None:
+            self.status_code = status_code
+            self._payload = payload
+            self.text = text
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    responses = [
+        _Response(500, {"error": 'Failed to start Chrome CDP on port 18800 for profile "openclaw".'}),
+        _Response(200, {"ok": True}),
+    ]
+    sleeps: list[float] = []
+
+    def fake_post(*args, **kwargs):
+        del args, kwargs
+        return responses.pop(0)
+
+    monkeypatch.setattr(runtime.requests, "post", fake_post)
+    monkeypatch.setattr(runtime, "_browser_profile_ready", lambda *args, **kwargs: False)
+    monkeypatch.setattr(runtime, "_cleanup_stale_browser_profile", lambda: None)
+    monkeypatch.setattr(runtime.time, "sleep", lambda seconds: sleeps.append(float(seconds)))
+
+    runtime._ensure_browser_profile_started("http://127.0.0.1:18791")
+
+    assert sleeps == [0.5]
+    assert responses == []
+
+
+def test_ensure_browser_profile_started_accepts_late_ready_profile(monkeypatch) -> None:
+    class _Response:
+        status_code = 500
+        text = 'Error: Failed to start Chrome CDP on port 18800 for profile "openclaw".'
+
+        def json(self) -> dict[str, str]:
+            return {"error": self.text}
+
+    ready = [False, True]
+    cleanup_calls: list[str] = []
+
+    monkeypatch.setattr(runtime.requests, "post", lambda *args, **kwargs: _Response())
+    monkeypatch.setattr(runtime, "_browser_profile_ready", lambda *args, **kwargs: ready.pop(0))
+    monkeypatch.setattr(runtime, "_cleanup_stale_browser_profile", lambda: cleanup_calls.append("cleanup"))
+    monkeypatch.setattr(runtime.time, "sleep", lambda _: None)
+
+    runtime._ensure_browser_profile_started("http://127.0.0.1:18791")
+
+    assert ready == []
+    assert cleanup_calls == []
+
+
+def test_ensure_browser_profile_started_cleans_stale_profile_before_retry(monkeypatch) -> None:
+    class _Response:
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload.get("error") or "")
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    responses = [
+        _Response(500, {"error": 'Failed to start Chrome CDP on port 18800 for profile "openclaw".'}),
+        _Response(200, {"ok": True}),
+    ]
+    cleanup_calls: list[str] = []
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(runtime.requests, "post", lambda *args, **kwargs: responses.pop(0))
+    monkeypatch.setattr(runtime, "_browser_profile_ready", lambda *args, **kwargs: False)
+    monkeypatch.setattr(runtime, "_cleanup_stale_browser_profile", lambda: cleanup_calls.append("cleanup"))
+    monkeypatch.setattr(runtime.time, "sleep", lambda seconds: sleeps.append(float(seconds)))
+
+    runtime._ensure_browser_profile_started("http://127.0.0.1:18791")
+
+    assert cleanup_calls == ["cleanup"]
+    assert sleeps == [0.5]
+    assert responses == []
+
+
+def test_ensure_embedded_openclaw_base_url_requires_profile_start(monkeypatch, tmp_path) -> None:
+    base_url = "http://127.0.0.1:18791"
+    calls: list[str] = []
+
+    monkeypatch.setattr(runtime, "_browser_server_ready", lambda candidate: candidate == base_url)
+    monkeypatch.setattr(runtime, "_probe_existing_browser_server", lambda: (base_url, 18789, 18791, 18800))
+
+    def _fake_start(candidate: str) -> None:
+        calls.append(candidate)
+        raise RuntimeError('Failed to start Chrome CDP on port 18800 for profile "openclaw".')
+
+    monkeypatch.setattr(runtime, "_ensure_browser_profile_started", _fake_start)
+    runtime.stop_embedded_openclaw_server()
+
+    try:
+        runtime.ensure_embedded_openclaw_base_url()
+    except RuntimeError as exc:
+        assert "Failed to start Chrome CDP" in str(exc)
+    else:
+        raise AssertionError("expected ensure_embedded_openclaw_base_url to propagate /start failure")
+
+    assert calls == [base_url]

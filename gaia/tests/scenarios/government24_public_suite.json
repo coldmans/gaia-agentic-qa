@@ -1,0 +1,82 @@
+{
+  "suite_id": "government24_public_v2",
+  "site": {
+    "name": "정부24",
+    "base_url": "https://www.gov.kr/portal/main",
+    "mode": "public_readonly"
+  },
+  "grader_configs": {
+    "reason_codes": {
+      "forbidden_reason_codes": [
+        "user_intervention_missing"
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "GOV24_001_HOME_SERVICE",
+      "name": "공공 서비스 홈 확인",
+      "url": "https://www.gov.kr/portal/main",
+      "goal": "정부24 홈에서 통합 검색, 자주 찾는 서비스, 분야별 서비스 메뉴 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "GOV24_002_SERVICE_SEARCH",
+      "name": "민원 서비스 검색 확인",
+      "url": "https://www.gov.kr/search?srhQuery=%EC%A3%BC%EB%AF%BC%EB%93%B1%EB%A1%9D%EB%93%B1%EB%B3%B8",
+      "goal": "주민등록등본 검색 결과에서 서비스명, 처리기관, 안내 문구 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "GOV24_003_SERVICE_DETAIL",
+      "name": "서비스 상세 안내 확인",
+      "url": "https://www.gov.kr/search?srhQuery=%EC%A0%84%EC%9E%85%EC%8B%A0%EA%B3%A0",
+      "goal": "전입신고 검색 결과에서 서비스 상세 안내를 열어 대상, 처리 절차, 필요 서류 같은 안내 정보를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "GOV24_004_CATEGORY_SERVICE",
+      "name": "분야별 서비스 확인",
+      "url": "https://www.gov.kr/portal/service/category",
+      "goal": "분야별 서비스 화면에서 생애주기, 분야, 기관 같은 분류 목록이 보이는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "GOV24_005_RESULT_FILTER",
+      "name": "검색 조건 변경 확인",
+      "url": "https://www.gov.kr/search?srhQuery=%EC%97%AC%EA%B6%8C",
+      "goal": "여권 검색 결과 화면에서 검색필터의 민원서비스, 기관정보, 정책정보 항목이나 관련 검색어 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    }
+  ]
+}

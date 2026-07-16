@@ -1,0 +1,100 @@
+{
+  "suite_id": "kyobo_public_v2",
+  "site": {
+    "name": "Kyobo Book Centre",
+    "base_url": "https://www.kyobobook.co.kr/",
+    "mode": "public_readonly"
+  },
+  "grader_configs": {
+    "reason_codes": {
+      "forbidden_reason_codes": [
+        "user_intervention_missing"
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "KYOBO_001_HOME_BOOKS",
+      "name": "서점 홈 주요 영역 확인",
+      "url": "https://www.kyobobook.co.kr/",
+      "goal": "교보문고 홈에서 검색 입력, 베스트셀러, 분야별 도서 메뉴 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KYOBO_002_BOOK_SEARCH",
+      "name": "도서 검색 결과 확인",
+      "url": "https://search.kyobobook.co.kr/search?keyword=%EC%9D%B8%EA%B3%B5%EC%A7%80%EB%8A%A5",
+      "goal": "인공지능 도서 검색 결과에서 책 제목, 저자, 가격 또는 출판사 정보 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KYOBO_003_BESTSELLER",
+      "name": "베스트셀러 목록 확인",
+      "url": "https://product.kyobobook.co.kr/bestseller/online",
+      "goal": "교보문고 베스트셀러 화면에서 순위, 책 제목, 저자 또는 가격 정보 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KYOBO_004_BOOK_DETAIL",
+      "name": "도서 상세 정보 확인",
+      "url": "https://search.kyobobook.co.kr/search?keyword=%EB%8D%B0%EC%9D%B4%ED%84%B0%20%EB%B6%84%EC%84%9D",
+      "goal": "데이터 분석 도서 검색 결과에서 공개 도서 하나를 열어 책 소개, 목차, 저자 또는 가격 정보를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KYOBO_005_CATEGORY_FILTER",
+      "name": "분야와 정렬 확인",
+      "url": "https://search.kyobobook.co.kr/search?keyword=%EA%B2%BD%EC%98%81",
+      "goal": "경영 도서 검색 결과에서 분야 필터나 정렬 옵션을 선택해 도서 목록 표시가 바뀌는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KYOBO_006_REVIEW_LIKE_SORT",
+      "name": "자몽살구클럽 리뷰 좋아요순 확인",
+      "url": "https://www.kyobobook.co.kr/",
+      "goal": "검색에 자몽살구클럽을 검색한 다음, 세 번째로 뜨는 상품을 클릭해줘. 이후 리뷰를 누른 다음 좋아요 순을 눌렀을 때 좋아요 순으로 댓글이 정렬되는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": true
+      },
+      "expected_signals": [
+        "자몽살구클럽",
+        "리뷰",
+        "좋아요 순",
+        "댓글"
+      ],
+      "time_budget_sec": 600
+    }
+  ]
+}

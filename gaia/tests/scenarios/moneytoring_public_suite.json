@@ -1,0 +1,82 @@
+{
+  "suite_id": "moneytoring_public_v2",
+  "site": {
+    "name": "머니터링",
+    "base_url": "https://www.moneytoring.ai/",
+    "mode": "public_readonly"
+  },
+  "grader_configs": {
+    "reason_codes": {
+      "forbidden_reason_codes": [
+        "user_intervention_missing"
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "MONEYTORING_001_MARKET_HOME",
+      "name": "금융 데이터 홈 확인",
+      "url": "https://www.moneytoring.ai/",
+      "goal": "머니터링 홈에서 종목 검색 입력, 주요 지수, 시장 뉴스나 분석 카드 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "MONEYTORING_002_STOCK_SEARCH",
+      "name": "시장 종목 언급 확인",
+      "url": "https://www.moneytoring.ai/",
+      "goal": "머니터링 홈의 마켓보이스 또는 관심종목 영역에서 삼성전자 같은 공개 기업명, 종목 정보, 가격 또는 등락률 정보 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "MONEYTORING_003_COMPANY_DETAIL",
+      "name": "종목 상세 정보 확인",
+      "url": "https://www.moneytoring.ai/",
+      "goal": "종목 상세 화면에서 현재가, 차트, 기업 개요 또는 투자 지표 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "MONEYTORING_004_MARKET_SECTION",
+      "name": "시장 섹션 탐색 확인",
+      "url": "https://www.moneytoring.ai/",
+      "goal": "시장 정보나 종목 발굴 섹션으로 이동해 목록형 금융 데이터가 보이는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "MONEYTORING_005_INDEX_OR_CALENDAR",
+      "name": "지수와 일정 정보 확인",
+      "url": "https://www.moneytoring.ai/",
+      "goal": "주요 지수나 경제 일정 영역을 열어 날짜, 지수명, 변동 정보 같은 공개 데이터가 보이는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    }
+  ]
+}

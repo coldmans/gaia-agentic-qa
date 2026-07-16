@@ -1,0 +1,285 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from scripts import push_metrics
+
+
+def test_gauge_escapes_prometheus_label_values() -> None:
+    lines = push_metrics._gauge(
+        "gaia_test_metric",
+        "test metric",
+        1,
+        {
+            "suite_id": 'suite"bad',
+            "scenario_id": "line\nbreak",
+            "site": r"path\\value",
+        },
+    )
+
+    metric = lines[-1]
+    assert 'suite_id="suite\\"bad"' in metric
+    assert 'scenario_id="line\\nbreak"' in metric
+    assert 'site="path\\\\\\\\value"' in metric
+
+
+def test_scenario_metrics_drop_sensitive_high_cardinality_labels() -> None:
+    summary = {
+        "suite_id": "auth_suite",
+        "site": {
+            "name": "Sensitive Site",
+            "base_url": "https://example.test/private/path",
+        },
+        "started_at": "2026-05-04T12:34:56+09:00",
+        "model": "gpt-5.5",
+        "provider": "openai",
+    }
+    results = [
+        {
+            "scenario_id": "AUTH_001",
+            "goal": "로그인해서 private 내용을 확인해줘",
+            "reason": "user@example.test 비밀번호가 필요함",
+            "status": "FAIL",
+            "duration_seconds": 3.5,
+            "summary": {"goal_completion_source": "auth_gate"},
+            "model": "gpt-5.5",
+            "provider": "openai",
+        }
+    ]
+
+    metrics = push_metrics.build_scenario_metrics(summary, results)
+
+    assert "last_reason" not in metrics
+    assert "started_at=" not in metrics
+    assert "site_url" not in metrics
+    assert "goal=" not in metrics
+    assert "user@example.test" not in metrics
+    assert "private/path" not in metrics
+    assert "gaia_scenario_last_run_timestamp_seconds" in metrics
+    assert 'completion="auth_gate"' in metrics
+
+
+def test_suite_metrics_exports_primary_success_rate() -> None:
+    summary = {
+        "suite_id": "external_public",
+        "site": {"name": "External Public"},
+        "model": "gpt-5.5",
+        "provider": "openai",
+        "runner_id": "macmini",
+        "metrics": {"runs_total": 2, "success_rate": 0.5},
+        "kpi_metrics": {
+            "scenario_success_rate": 0.5,
+            "primary_success_rate": 1.0,
+            "targets": {"primary_success_rate": 0.7},
+            "counts": {"success": 1, "blocked": 1, "primary_runs": 1},
+        },
+        "status_counts": {"SUCCESS": 1, "BLOCKED_USER_ACTION": 1},
+    }
+
+    metrics = push_metrics.build_suite_metrics(summary)
+
+    assert "gaia_suite_primary_success_rate" in metrics
+    assert "gaia_target_primary_success_rate" in metrics
+    assert "gaia_count_primary_runs" in metrics
+    assert 'runner_id="macmini"' in metrics
+
+
+def test_suite_metrics_enrich_external_manifest_labels() -> None:
+    summary = {
+        "suite_id": "musinsa_public_v2",
+        "site": {"name": "MUSINSA"},
+        "model": "gpt-5.5",
+        "provider": "openai",
+        "metrics": {"runs_total": 5, "success_rate": 0.8},
+        "kpi_metrics": {
+            "scenario_success_rate": 0.8,
+            "primary_success_rate": 0.8,
+            "targets": {},
+            "counts": {"success": 4, "primary_runs": 5},
+        },
+    }
+
+    metrics = push_metrics.build_suite_metrics(summary)
+
+    assert 'site_key="musinsa"' in metrics
+    assert 'category="commerce_product"' in metrics
+    assert 'volatility="high"' in metrics
+
+
+def test_external_pack_metrics_roll_up_sites_categories_and_reason_codes() -> None:
+    summary = {
+        "pack_id": "kpi_pack_test",
+        "overall_kpis": {
+            "scenario_success_rate": 0.5,
+            "primary_success_rate": 0.5,
+            "progress_stop_failure_rate": 0.5,
+            "intervention_rate": 0.0,
+            "avg_time_seconds": 7.5,
+            "counts": {"runs_total": 2, "success": 1},
+        },
+        "runner_id": "macmini",
+        "suites": [
+            {"suite_id": "musinsa_public_v2"},
+            {"suite_id": "daum_public_v2"},
+        ],
+    }
+    results = [
+        {
+            "suite_id": "musinsa_public_v2",
+            "scenario_id": "MUSINSA_001",
+            "status": "SUCCESS",
+            "duration_seconds": 5.0,
+            "goal": "가방을 찾아줘",
+            "model": "gpt-5.5",
+            "provider": "openai",
+            "runner_id": "macmini",
+        },
+        {
+            "suite_id": "daum_public_v2",
+            "scenario_id": "DAUM_001",
+            "status": "FAIL",
+            "duration_seconds": 10.0,
+            "reason": "free-form failure text should stay out of labels",
+            "summary": {"reason_code_summary": {"option_ref_missing": 2}},
+            "model": "gpt-5.5",
+            "provider": "openai",
+            "runner_id": "macmini",
+        },
+    ]
+
+    metrics = push_metrics.build_external_pack_metrics(summary, results)
+
+    assert "gaia_external_pack_site_count" in metrics
+    assert 'site_key="musinsa"' in metrics
+    assert 'category="commerce_product"' in metrics
+    assert 'reason_code="option_ref_missing"' in metrics
+    assert 'runner_id="macmini"' in metrics
+    assert "free-form failure text" not in metrics
+    assert "가방을 찾아줘" not in metrics
+
+
+def test_push_suite_dir_uses_stable_suite_instance(tmp_path, monkeypatch) -> None:
+    suite_dir = tmp_path / "auth_suite_20260504_123456"
+    suite_dir.mkdir()
+    (suite_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "suite_id": "auth_suite",
+                "site": {"name": "Sensitive Site"},
+                "model": "gpt-5.5",
+                "provider": "openai",
+                "metrics": {"runs_total": 1},
+                "kpi_metrics": {"targets": {}, "counts": {}},
+                "status_counts": {"SUCCESS": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_dir / "results.json").write_text("[]", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_push(metrics_text: str, instance: str, gateway_url: str, token: str | None) -> bool:
+        captured["metrics_text"] = metrics_text
+        captured["instance"] = instance
+        captured["gateway_url"] = gateway_url
+        captured["token"] = token
+        return True
+
+    monkeypatch.setattr(push_metrics, "push_to_gateway", fake_push)
+
+    assert push_metrics.push_suite_dir(suite_dir, "http://monitor.example", "secret") is True
+    assert captured["instance"] == "auth_suite"
+
+
+def test_push_suite_dir_uses_pack_instance_and_external_rollups(tmp_path, monkeypatch) -> None:
+    suite_dir = tmp_path / "kpi_pack_20260508_120000"
+    suite_dir.mkdir()
+    (suite_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "pack_id": "kpi_pack_20260508_120000",
+                "overall_kpis": {
+                    "scenario_success_rate": 1.0,
+                    "primary_success_rate": 1.0,
+                    "counts": {"runs_total": 1, "success": 1},
+                },
+                "suites": [{"suite_id": "musinsa_public_v2"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_dir / "results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "suite_id": "musinsa_public_v2",
+                    "scenario_id": "MUSINSA_001",
+                    "status": "SUCCESS",
+                    "duration_seconds": 1.5,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_push(metrics_text: str, instance: str, gateway_url: str, token: str | None) -> bool:
+        captured["metrics_text"] = metrics_text
+        captured["instance"] = instance
+        return True
+
+    monkeypatch.setattr(push_metrics, "push_to_gateway", fake_push)
+
+    assert push_metrics.push_suite_dir(suite_dir, "http://monitor.example", "secret") is True
+    assert captured["instance"] == "kpi_pack_20260508_120000"
+    assert "gaia_external_pack_success_rate" in str(captured["metrics_text"])
+
+
+def test_push_suite_dir_can_share_suite_definition(tmp_path, monkeypatch) -> None:
+    suite_dir = tmp_path / "auth_suite_20260504_123456"
+    suite_dir.mkdir()
+    suite_json = tmp_path / "auth_suite.json"
+    suite_json.write_text(
+        json.dumps({"suite_id": "auth_suite_public_v1", "scenarios": [{"id": "AUTH_001", "goal": "로그인"}]}),
+        encoding="utf-8",
+    )
+    (suite_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "suite_id": "auth_suite_public_v1",
+                "site": {"name": "Sensitive Site"},
+                "model": "gpt-5.5",
+                "provider": "openai",
+                "metrics": {"runs_total": 1},
+                "kpi_metrics": {"targets": {}, "counts": {}},
+                "status_counts": {"SUCCESS": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (suite_dir / "results.json").write_text("[]", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(push_metrics, "push_to_gateway", lambda *args, **kwargs: True)
+
+    def fake_upload(**kwargs):
+        captured.update(kwargs)
+        return "http://monitor.example/shared/suites/auth_suite.json"
+
+    monkeypatch.setattr(push_metrics, "upload_shared_suite", fake_upload)
+
+    assert (
+        push_metrics.push_suite_dir(
+            suite_dir,
+            "http://monitor.example",
+            "secret",
+            suite_json_path=suite_json,
+            share_suite=True,
+        )
+        is True
+    )
+    assert captured["server"] == "http://monitor.example"
+    assert captured["token"] == "secret"
+    assert captured["suite_key"] == "auth_suite"
+    assert captured["suite_payload"]["scenarios"] == [{"id": "AUTH_001", "goal": "로그인"}]

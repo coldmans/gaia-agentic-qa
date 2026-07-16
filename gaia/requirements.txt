@@ -1,0 +1,2 @@
+# Compatibility entrypoint for existing development scripts.
+-e .[all]

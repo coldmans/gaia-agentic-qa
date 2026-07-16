@@ -1,0 +1,1817 @@
+"""탐색 결과 뷰어 위젯 - 기능 중심 테스트 결과 표시"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Callable
+
+from PySide6.QtCore import Qt, Signal, QSize, QTimer
+from PySide6.QtGui import QColor, QFont, QMovie, QPixmap
+from PySide6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QFrame,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QSplitter,
+    QTextEdit,
+    QFileDialog,
+    QSizePolicy,
+    QGridLayout,
+    QDialog,
+    QDialogButtonBox,
+    QApplication,
+    QAbstractItemView,
+)
+
+
+class GifViewerDialog(QDialog):
+    """GIF 전체화면 뷰어 다이얼로그"""
+
+    def __init__(self, gif_path: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("테스트 녹화 보기")
+        self.setModal(True)
+        self.resize(900, 700)
+
+        self.setStyleSheet("""
+            QDialog {
+                background: #0f0f1a;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # GIF 표시
+        self._gif_label = QLabel(self)
+        self._gif_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._movie = QMovie(gif_path)
+        self._movie.setScaledSize(QSize(860, 600))
+        self._gif_label.setMovie(self._movie)
+        self._movie.start()
+        layout.addWidget(self._gif_label)
+
+        # 버튼
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        open_file_btn = QPushButton("파일 위치 열기", self)
+        open_file_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(99, 102, 241, 0.2);
+                color: #a5b4fc;
+                border: 1px solid rgba(99, 102, 241, 0.4);
+                border-radius: 8px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background: rgba(99, 102, 241, 0.3);
+            }
+        """)
+        open_file_btn.clicked.connect(lambda: self._open_file_location(gif_path))
+        btn_layout.addWidget(open_file_btn)
+
+        close_btn = QPushButton("닫기", self)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.1);
+                color: #9ca3af;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 8px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.15);
+            }
+        """)
+        close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+
+    def _open_file_location(self, path: str):
+        """파일 위치 열기"""
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", path])
+        elif sys.platform == "win32":
+            subprocess.run(["explorer", "/select,", path])
+        else:
+            subprocess.run(["xdg-open", os.path.dirname(path)])
+
+    def closeEvent(self, event):
+        if self._movie:
+            self._movie.stop()
+        super().closeEvent(event)
+
+
+class StepDetailDialog(QDialog):
+    """스텝 상세 정보 다이얼로그"""
+
+    def __init__(
+        self,
+        step_data: Dict,
+        step_index: int,
+        screenshots_dir: str | None = None,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f"스텝 #{step_index + 1} 상세 정보")
+        self.setModal(True)
+        self.resize(800, 600)
+
+        self.setStyleSheet("""
+            QDialog {
+                background: #f8fafc;
+            }
+            QLabel {
+                color: #1f2937;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        # 헤더
+        header = QHBoxLayout()
+
+        result = step_data.get("success", False)
+        result_badge = QLabel("✅ PASS" if result else "❌ FAIL", self)
+        result_badge.setStyleSheet(f"""
+            QLabel {{
+                background: {"#dcfce7" if result else "#fee2e2"};
+                color: {"#166534" if result else "#991b1b"};
+                padding: 6px 12px;
+                border-radius: 16px;
+                font-weight: 600;
+                font-size: 13px;
+            }}
+        """)
+        header.addWidget(result_badge)
+        header.addStretch()
+
+        step_label = QLabel(f"Step {step_index + 1}", self)
+        step_label.setStyleSheet("font-size: 14px; color: #6b7280;")
+        header.addWidget(step_label)
+
+        layout.addLayout(header)
+
+        # 메인 콘텐츠 (스플리터)
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+
+        # 왼쪽: 스크린샷
+        screenshot_frame = QFrame(splitter)
+        screenshot_frame.setStyleSheet("""
+            QFrame {
+                background: #1a1a2e;
+                border-radius: 12px;
+            }
+        """)
+        screenshot_layout = QVBoxLayout(screenshot_frame)
+        screenshot_layout.setContentsMargins(12, 12, 12, 12)
+
+        screenshot_title = QLabel("📸 스크린샷", screenshot_frame)
+        screenshot_title.setStyleSheet(
+            "color: #9ca3af; font-size: 12px; font-weight: 600;"
+        )
+        screenshot_layout.addWidget(screenshot_title)
+
+        self._screenshot_label = QLabel(screenshot_frame)
+        self._screenshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._screenshot_label.setMinimumSize(350, 250)
+        self._screenshot_label.setStyleSheet("color: #6b7280;")
+
+        # 스크린샷 로드
+        screenshot_loaded = False
+        if screenshots_dir:
+            screenshot_path = os.path.join(
+                screenshots_dir, f"step_{step_index:03d}.png"
+            )
+            if os.path.exists(screenshot_path):
+                pixmap = QPixmap(screenshot_path)
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(
+                        350,
+                        250,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    self._screenshot_label.setPixmap(scaled)
+                    screenshot_loaded = True
+
+        # base64 스크린샷 시도
+        if not screenshot_loaded:
+            screenshot_b64 = step_data.get("screenshot_before") or step_data.get(
+                "screenshot_after"
+            )
+            if screenshot_b64:
+                import base64
+
+                try:
+                    img_data = base64.b64decode(screenshot_b64)
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(img_data)
+                    if not pixmap.isNull():
+                        scaled = pixmap.scaled(
+                            350,
+                            250,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                        self._screenshot_label.setPixmap(scaled)
+                        screenshot_loaded = True
+                except Exception:
+                    pass
+
+        if not screenshot_loaded:
+            self._screenshot_label.setText("스크린샷 없음")
+
+        screenshot_layout.addWidget(self._screenshot_label)
+        screenshot_layout.addStretch()
+
+        splitter.addWidget(screenshot_frame)
+
+        # 오른쪽: 상세 정보
+        info_frame = QFrame(splitter)
+        info_frame.setStyleSheet("""
+            QFrame {
+                background: white;
+                border-radius: 12px;
+                border: 1px solid #e5e7eb;
+            }
+        """)
+        info_layout = QVBoxLayout(info_frame)
+        info_layout.setContentsMargins(16, 16, 16, 16)
+        info_layout.setSpacing(12)
+
+        # 기능 설명
+        feature_desc = step_data.get("feature_description", "")
+        if feature_desc:
+            self._add_info_row(info_layout, "🎯 테스트 기능", feature_desc)
+
+        # 시나리오
+        scenario = step_data.get("test_scenario", "")
+        if scenario:
+            self._add_info_row(info_layout, "📋 시나리오", scenario)
+
+        # 비즈니스 영향
+        impact = step_data.get("business_impact", "")
+        if impact:
+            self._add_info_row(info_layout, "💼 비즈니스 영향", impact)
+
+        # 액션 정보
+        decision = step_data.get("decision", {})
+        action = decision.get("selected_action", {})
+        if action:
+            action_type = action.get("action_type", "N/A")
+            action_desc = action.get("description", "N/A")
+            self._add_info_row(
+                info_layout, "🖱️ 수행 액션", f"{action_type}: {action_desc}"
+            )
+
+            reasoning = action.get("reasoning", "")
+            if reasoning:
+                self._add_info_row(info_layout, "💭 액션 이유", reasoning)
+
+        # 예상 결과
+        expected = decision.get("expected_outcome", "")
+        if expected:
+            self._add_info_row(info_layout, "📝 예상 결과", expected)
+
+        # 에러 메시지
+        error_msg = step_data.get("error_message", "")
+        if error_msg:
+            self._add_info_row(info_layout, "⚠️ 에러", error_msg, is_error=True)
+
+        # URL
+        url = step_data.get("url", "")
+        if url:
+            self._add_info_row(info_layout, "🔗 URL", url)
+
+        info_layout.addStretch()
+
+        splitter.addWidget(info_frame)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+
+        layout.addWidget(splitter, stretch=1)
+
+        # 닫기 버튼
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        btn_box.rejected.connect(self.close)
+        layout.addWidget(btn_box)
+
+    def _add_info_row(
+        self, layout: QVBoxLayout, label: str, value: str, is_error: bool = False
+    ):
+        """정보 행 추가"""
+        row = QVBoxLayout()
+        row.setSpacing(4)
+
+        label_widget = QLabel(label, self)
+        label_widget.setStyleSheet("font-size: 11px; color: #6b7280; font-weight: 600;")
+        row.addWidget(label_widget)
+
+        value_widget = QLabel(value, self)
+        value_widget.setWordWrap(True)
+        if is_error:
+            value_widget.setStyleSheet(
+                "font-size: 13px; color: #dc2626; background: #fef2f2; padding: 8px; border-radius: 6px;"
+            )
+        else:
+            value_widget.setStyleSheet("font-size: 13px; color: #1f2937;")
+        row.addWidget(value_widget)
+
+        layout.addLayout(row)
+
+
+class SummaryDialog(QDialog):
+    """요약 정보를 별도 창으로 표시합니다."""
+
+    def __init__(self, summary: Dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("요약")
+        self.setModal(True)
+        self.resize(520, 380)
+
+        self.setStyleSheet("""
+            QDialog {
+                background: #f8fafc;
+            }
+            QLabel {
+                color: #1f2937;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        title = QLabel("요약", self)
+        title.setStyleSheet("font-size: 16px; font-weight: 700;")
+        layout.addWidget(title)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(12)
+
+        rows = [
+            ("총 스텝", summary.get("total", 0)),
+            ("성공", summary.get("success", 0)),
+            ("실패", summary.get("fail", 0)),
+            ("이슈", summary.get("issues", 0)),
+            ("커버리지", summary.get("coverage", "0%")),
+            ("소요 시간", summary.get("duration", "0s")),
+        ]
+
+        for row_index, (label, value) in enumerate(rows):
+            label_widget = QLabel(label, self)
+            label_widget.setStyleSheet("font-size: 12px; color: #6b7280;")
+            value_widget = QLabel(str(value), self)
+            value_widget.setStyleSheet(
+                "font-size: 18px; font-weight: 700; color: #4f46e5;"
+            )
+            grid.addWidget(label_widget, row_index, 0)
+            grid.addWidget(value_widget, row_index, 1)
+
+        layout.addLayout(grid)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("닫기", self)
+        close_btn.setObjectName("GhostButton")
+        close_btn.clicked.connect(self.close)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+
+class StepReplayWidget(QFrame):
+    """스텝 단위 재생 위젯 (before/after 이미지 토글)"""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._frames: List[QPixmap] = []
+        self._frame_index = 0
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._advance_frame)
+        self._play_remaining = 0
+
+        # Toss 디자인 시스템 — 흰 카드 + 1px 회색 테두리, 미리보기 영역은 light bg
+        self.setObjectName("StepReplayCard")
+        self.setStyleSheet("""
+            QFrame#StepReplayCard {
+                background: #ffffff;
+                border-radius: 12px;
+                border: 1px solid #e5e8eb;
+            }
+            QLabel#StepReplayTitle {
+                font-size: 13px;
+                font-weight: 700;
+                color: #191f28;
+                background: transparent;
+                letter-spacing: -0.2px;
+            }
+            QLabel#StepReplayStatus {
+                color: #8b95a1;
+                font-size: 11.5px;
+                background: transparent;
+            }
+            QLabel#StepReplayPreview {
+                color: #8b95a1;
+                background: #f9fafb;
+                border: 1px solid #e5e8eb;
+                border-radius: 10px;
+                padding: 12px;
+                font-size: 12.5px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel("최근 선택 스텝 미리보기", self)
+        title.setObjectName("StepReplayTitle")
+        header.addWidget(title)
+        header.addStretch()
+
+        self._status_label = QLabel("스텝을 선택하면 before/after를 볼 수 있습니다", self)
+        self._status_label.setObjectName("StepReplayStatus")
+        header.addWidget(self._status_label)
+        layout.addLayout(header)
+
+        self._preview_label = QLabel("선택한 테스트를 재생할 수 있습니다", self)
+        self._preview_label.setObjectName("StepReplayPreview")
+        self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview_label.setMinimumSize(320, 180)
+        layout.addWidget(self._preview_label)
+
+        controls = QHBoxLayout()
+        controls.addStretch()
+
+        self._play_button = QPushButton("재생", self)
+        self._play_button.setObjectName("GhostButton")
+        self._play_button.clicked.connect(self.play)
+        controls.addWidget(self._play_button)
+
+        self._open_button = QPushButton("크게 보기", self)
+        self._open_button.setObjectName("GhostButton")
+        self._open_button.setEnabled(False)
+        controls.addWidget(self._open_button)
+
+        layout.addLayout(controls)
+
+    def load_step(self, step_data: Dict, screenshots_dir: str | None):
+        self._frames = []
+        self._frame_index = 0
+        self._status_label.setText("")
+
+        before_pixmap = self._load_step_pixmap(step_data, screenshots_dir, "before")
+        after_pixmap = self._load_step_pixmap(step_data, screenshots_dir, "after")
+
+        for pixmap in [before_pixmap, after_pixmap]:
+            if pixmap is not None and not pixmap.isNull():
+                self._frames.append(pixmap)
+
+        if not self._frames:
+            self._preview_label.setText("스크린샷이 없습니다")
+            self._play_button.setEnabled(False)
+            self._open_button.setEnabled(False)
+            self._status_label.setText("선택한 스텝에 이미지가 없습니다")
+            return
+
+        self._play_button.setEnabled(len(self._frames) > 1)
+        self._open_button.setEnabled(True)
+        self._render_frame(self._frames[0])
+        self._status_label.setText("before/after 비교 가능" if len(self._frames) > 1 else "단일 스냅샷")
+
+    def play(self):
+        if len(self._frames) < 2:
+            return
+        if self._play_timer.isActive():
+            self._play_timer.stop()
+            self._status_label.setText("재생 일시정지")
+            self._play_button.setText("재생")
+            return
+        self._play_remaining = 8
+        self._status_label.setText("before/after 재생 중")
+        self._play_button.setText("일시정지")
+        self._play_timer.start(700)
+
+    def _advance_frame(self):
+        if self._play_remaining <= 0:
+            self._play_timer.stop()
+            self._play_button.setText("재생")
+            self._status_label.setText("재생 완료")
+            return
+        self._play_remaining -= 1
+        if not self._frames:
+            self._play_timer.stop()
+            return
+        self._frame_index = (self._frame_index + 1) % len(self._frames)
+        self._render_frame(self._frames[self._frame_index])
+
+    def _render_frame(self, pixmap: QPixmap):
+        scaled = pixmap.scaled(
+            560,
+            260,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._preview_label.setPixmap(scaled)
+
+    def _load_step_pixmap(
+        self,
+        step_data: Dict,
+        screenshots_dir: str | None,
+        which: str,
+    ) -> QPixmap | None:
+        if screenshots_dir:
+            step_index = step_data.get("step_number", 0)
+            if step_index:
+                candidates = []
+                if which == "before":
+                    candidates = [
+                        f"step_{step_index:03d}_before.png",
+                        f"step_{step_index:03d}.png",
+                    ]
+                else:
+                    candidates = [
+                        f"step_{step_index:03d}_after.png",
+                        f"step_{step_index:03d}.png",
+                    ]
+                for name in candidates:
+                    screenshot_path = os.path.join(screenshots_dir, name)
+                    if os.path.exists(screenshot_path):
+                        pixmap = QPixmap(screenshot_path)
+                        if not pixmap.isNull():
+                            return pixmap
+
+        screenshot_key = (
+            "screenshot_before" if which == "before" else "screenshot_after"
+        )
+        screenshot_b64 = step_data.get(screenshot_key)
+        if not screenshot_b64:
+            return None
+        try:
+            import base64
+
+            img_data = base64.b64decode(screenshot_b64)
+            pixmap = QPixmap()
+            pixmap.loadFromData(img_data)
+            return pixmap if not pixmap.isNull() else None
+        except Exception:
+            return None
+
+
+class ScenarioSummaryCard(QFrame):
+    """테스트 시나리오 요약 카드"""
+
+    def __init__(self, scenario: Dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("ScenarioCard")
+
+        result = scenario.get("result", "pass")
+        border_color = (
+            "rgba(5, 150, 105, 0.5)" if result == "pass" else "rgba(220, 38, 38, 0.5)"
+        )
+        bg_color = (
+            "rgba(209, 250, 229, 0.3)"
+            if result == "pass"
+            else "rgba(254, 226, 226, 0.3)"
+        )
+
+        self.setStyleSheet(f"""
+            QFrame#ScenarioCard {{
+                background: {bg_color};
+                border-radius: 12px;
+                border: 1px solid {border_color};
+                padding: 8px;
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(4)
+
+        # 시나리오 이름
+        name = scenario.get("name", "알 수 없음")
+        name_label = QLabel(name, self)
+        name_label.setStyleSheet("font-size: 13px; font-weight: 600; color: #1f2937;")
+        layout.addWidget(name_label)
+
+        # 기능 설명
+        feature = scenario.get("feature", "")
+        if feature:
+            feature_label = QLabel(feature, self)
+            feature_label.setStyleSheet("font-size: 11px; color: #4b5563;")
+            layout.addWidget(feature_label)
+
+        # 스텝 수 및 결과
+        stats = QHBoxLayout()
+        steps_count = len(scenario.get("steps", []))
+        passed = scenario.get("passed", 0)
+        failed = scenario.get("failed", 0)
+
+        result_icon = "✅" if result == "pass" else "❌"
+        stats_label = QLabel(
+            f"{result_icon} {steps_count} steps ({passed} passed, {failed} failed)",
+            self,
+        )
+        stats_label.setStyleSheet("font-size: 10px; color: #6b7280;")
+        stats.addWidget(stats_label)
+        stats.addStretch()
+        layout.addLayout(stats)
+
+
+class ExplorationResultCard(QFrame):
+    """개별 탐색 결과 카드 (전면 개편 — 시인성 강화).
+
+    Layout:
+      [● status]  [URL/타이틀 .. 굵게]                     [시간]
+                  성공률 75%  ·  N steps  ·  Y passed / Z failed
+      [차단/이슈 사유 한 줄 — 있을 때만]
+    """
+
+    clicked = Signal(str)
+
+    def __init__(self, file_path: str, summary: Dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.setObjectName("HistoryCard")
+        self.setProperty("selected", False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(90)
+
+        status_raw = str(summary.get("status") or "").lower()
+        passed = int(summary.get("success_count") or 0)
+        failed = max(0, int(summary.get("total_steps") or 0) - passed)
+        # status가 명시 안 됐으면 통계로 추정
+        if not status_raw:
+            if failed > 0:
+                status_raw = "failed"
+            elif passed > 0:
+                status_raw = "success"
+            else:
+                status_raw = "unknown"
+        # 상태별 컬러
+        status_palette = {
+            "success": ("#1f9d6a", "성공"),
+            "failed": ("#ef4444", "실패"),
+            "blocked": ("#f59e0b", "차단"),
+            "skipped": ("#8b95a1", "건너뜀"),
+            "unknown": ("#8b95a1", "기록"),
+        }
+        dot_color, status_label = status_palette.get(status_raw, status_palette["unknown"])
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(12)
+
+        # 좌측 상태 dot
+        dot = QLabel(self)
+        dot.setFixedSize(10, 10)
+        dot.setStyleSheet(
+            f"background: {dot_color}; border-radius: 5px;"
+        )
+        # dot은 세로 가운데 정렬을 위해 wrapper에 담음
+        dot_wrap = QVBoxLayout()
+        dot_wrap.setContentsMargins(0, 6, 0, 0)
+        dot_wrap.setSpacing(0)
+        dot_wrap.addWidget(dot)
+        dot_wrap.addStretch(1)
+        outer.addLayout(dot_wrap)
+
+        # 본문 (URL + 메타 + 통계)
+        body = QVBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(6)
+
+        # 상단 행: 모드/상태 chip + URL 굵게  /  우측 timestamp
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+        top_row.setContentsMargins(0, 0, 0, 0)
+
+        mode_text = str(summary.get("mode") or "").lower()
+        if mode_text:
+            mode_chip = QLabel(mode_text.upper(), self)
+            mode_chip.setStyleSheet(
+                "background: #eef1fc; color: #2f41b0; padding: 2px 8px; "
+                "border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: 0.3px;"
+            )
+            top_row.addWidget(mode_chip)
+
+        status_chip = QLabel(status_label, self)
+        status_chip.setStyleSheet(
+            f"background: {self._tinted_bg(dot_color)}; color: {dot_color}; padding: 2px 8px; "
+            f"border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: 0.3px;"
+        )
+        top_row.addWidget(status_chip)
+        top_row.addStretch(1)
+
+        timestamp = str(summary.get("timestamp") or "")
+        if timestamp:
+            time_label = QLabel(timestamp, self)
+            time_label.setStyleSheet(
+                "font-size: 11px; color: #8b95a1; background: transparent; font-weight: 600;"
+            )
+            top_row.addWidget(time_label)
+
+        body.addLayout(top_row)
+
+        # URL (제목 역할) — 큰 굵은 텍스트
+        url = str(summary.get("start_url") or "Unknown URL")
+        display_url = url if len(url) <= 56 else url[:53] + "…"
+        url_label = QLabel(display_url, self)
+        url_label.setStyleSheet(
+            "font-size: 14px; font-weight: 700; color: #191f28; background: transparent;"
+        )
+        url_label.setToolTip(url)
+        body.addWidget(url_label)
+
+        # 통계 한 줄 — 핵심 숫자만 inline으로
+        total_steps = int(summary.get("total_steps") or 0)
+        success_count = int(summary.get("success_count") or 0)
+        fail_count = max(0, total_steps - success_count)
+        success_rate = (success_count / total_steps * 100.0) if total_steps else 0.0
+        has_gif = bool(summary.get("has_gif"))
+        issues_count = int(summary.get("issues_count") or 0)
+
+        stats_parts: List[str] = []
+        if total_steps:
+            stats_parts.append(
+                f'<span style="color:#191f28; font-weight:700;">성공률 {success_rate:.0f}%</span>'
+            )
+        stats_parts.append(f'<span>{total_steps} steps</span>')
+        if success_count:
+            stats_parts.append(
+                f'<span style="color:#1f9d6a; font-weight:700;">✓ {success_count}</span>'
+            )
+        if fail_count:
+            stats_parts.append(
+                f'<span style="color:#ef4444; font-weight:700;">✕ {fail_count}</span>'
+            )
+        if issues_count:
+            stats_parts.append(
+                f'<span style="color:#f59e0b; font-weight:700;">이슈 {issues_count}</span>'
+            )
+        if has_gif:
+            stats_parts.append('<span style="color:#8b95a1;">녹화 있음</span>')
+
+        sep = '  <span style="color:#d1d6db;">·</span>  '
+        stats_html = sep.join(stats_parts)
+        stats_label = QLabel(stats_html, self)
+        stats_label.setStyleSheet(
+            "font-size: 11.5px; color: #6b7684; background: transparent;"
+        )
+        stats_label.setTextFormat(Qt.TextFormat.RichText)
+        body.addWidget(stats_label)
+
+        # 차단/실패 사유 한 줄 (있을 때만)
+        reason = str(summary.get("reason") or summary.get("blocked_reason") or "").strip()
+        if reason and reason != "-":
+            reason_text = reason if len(reason) <= 80 else reason[:77] + "…"
+            reason_label = QLabel(reason_text, self)
+            reason_label.setStyleSheet(
+                "font-size: 11px; color: #8b95a1; background: transparent; "
+                "font-style: italic; padding-top: 2px;"
+            )
+            reason_label.setToolTip(reason)
+            body.addWidget(reason_label)
+
+        outer.addLayout(body, stretch=1)
+
+    @staticmethod
+    def _tinted_bg(hex_color: str) -> str:
+        """상태 컬러에 매칭되는 옅은 배경색 반환."""
+        mapping = {
+            "#1f9d6a": "#e9f7f0",  # success
+            "#ef4444": "#fef2f2",  # failed
+            "#f59e0b": "#fffbeb",  # blocked
+            "#8b95a1": "#f2f4f6",  # unknown
+        }
+        return mapping.get(hex_color, "#f2f4f6")
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", bool(selected))
+        style = self.style()
+        if style is not None:
+            style.unpolish(self); style.polish(self); self.update()
+
+    def mousePressEvent(self, event):
+        self.clicked.emit(self.file_path)
+        super().mousePressEvent(event)
+
+
+class ExplorationDetailView(QWidget):
+    """탐색 결과 상세 뷰 - 기능 중심"""
+
+    replay_requested = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._steps = []
+        self._screenshots_dir = None
+        self._summary_data: Dict[str, object] = {}
+        self._setup_ui()
+
+    def _setup_ui(self):
+        # Toss 디자인 시스템과 통일된 ExplorationDetailView 전용 스타일
+        self.setStyleSheet(
+            """
+            QFrame#DetailTopContainer {
+                background: transparent;
+                border: none;
+            }
+            QLabel#DetailSectionTitle {
+                color: #191f28;
+                font-size: 14px;
+                font-weight: 700;
+                background: transparent;
+                letter-spacing: -0.2px;
+            }
+            QFrame#DetailSummaryCard {
+                background: #ffffff;
+                border: 1px solid #e5e8eb;
+                border-radius: 12px;
+            }
+            QLabel#DetailSummaryValue {
+                color: #191f28;
+                font-size: 22px;
+                font-weight: 800;
+                background: transparent;
+            }
+            QLabel#DetailSummaryValuePass { color: #1f9d6a; }
+            QLabel#DetailSummaryValueFail { color: #ef4444; }
+            QLabel#DetailSummaryValueWarn { color: #f59e0b; }
+            QLabel#DetailSummaryValueRate { color: #3a50d2; }
+            QLabel#DetailSummaryLabel {
+                color: #6b7684;
+                font-size: 11.5px;
+                font-weight: 600;
+                background: transparent;
+            }
+            QFrame#DetailSummaryDivider {
+                background: #f2f4f6;
+                max-width: 1px;
+            }
+            QTableWidget#DetailTable {
+                background: #ffffff;
+                border: 1px solid #e5e8eb;
+                border-radius: 12px;
+                gridline-color: #f2f4f6;
+                color: #191f28;
+                font-size: 12.5px;
+            }
+            QTableWidget#DetailTable::item {
+                padding: 8px 10px;
+            }
+            QTableWidget#DetailTable::item:selected {
+                background: #eef1fc;
+                color: #2f41b0;
+            }
+            QHeaderView::section {
+                background: #f9fafb;
+                color: #4e5968;
+                padding: 10px 8px;
+                font-weight: 700;
+                font-size: 12px;
+                border: none;
+                border-bottom: 1px solid #e5e8eb;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        self._top_container = QFrame(self)
+        self._top_container.setObjectName("DetailTopContainer")
+        top_layout = QVBoxLayout(self._top_container)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(12)
+
+        # 헤더
+        header = QHBoxLayout()
+        self._title_label = QLabel("테스트 상세 결과", self)
+        self._title_label.setObjectName("DetailSectionTitle")
+        header.addWidget(self._title_label)
+        header.addStretch()
+
+        self._toggle_top_button = QPushButton("미리보기 숨기기", self)
+        self._toggle_top_button.setObjectName("GhostButton")
+        self._toggle_top_button.clicked.connect(self._toggle_top_section)
+        header.addWidget(self._toggle_top_button)
+
+        self._export_button = QPushButton("CSV 내보내기", self)
+        self._export_button.setObjectName("GhostButton")
+        self._export_button.clicked.connect(self._export_csv)
+        header.addWidget(self._export_button)
+
+        top_layout.addLayout(header)
+
+        summary_and_preview = QHBoxLayout()
+        summary_and_preview.setSpacing(14)
+
+        # 요약 카드 — Toss 스타일 (흰 배경 + 1px 회색 테두리 + divider 구분)
+        summary_card = QFrame(self._top_container)
+        summary_card.setObjectName("DetailSummaryCard")
+        summary_layout = QHBoxLayout(summary_card)
+        summary_layout.setContentsMargins(20, 16, 20, 16)
+        summary_layout.setSpacing(0)
+
+        self._summary_labels = {}
+        # 키별 색상 매핑 (Toss tokens)
+        _value_colors = {
+            "total": "DetailSummaryValue",          # #191f28 (default)
+            "success": "DetailSummaryValuePass",    # #1f9d6a
+            "fail": "DetailSummaryValueFail",       # #ef4444
+            "issues": "DetailSummaryValueWarn",     # #f59e0b
+            "coverage": "DetailSummaryValueRate",   # #3a50d2
+            "duration": "DetailSummaryValue",       # #191f28
+        }
+        items = [
+            ("total", "총 스텝"),
+            ("success", "성공"),
+            ("fail", "실패"),
+            ("issues", "이슈"),
+            ("coverage", "커버리지"),
+            ("duration", "소요 시간"),
+        ]
+        for idx, (key, label_text) in enumerate(items):
+            if idx > 0:
+                divider = QFrame(summary_card)
+                divider.setObjectName("DetailSummaryDivider")
+                divider.setFixedWidth(1)
+                divider.setMaximumHeight(46)
+                summary_layout.addWidget(divider, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+            col = QVBoxLayout()
+            col.setSpacing(4)
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            name_label = QLabel(label_text, summary_card)
+            name_label.setObjectName("DetailSummaryLabel")
+            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(name_label)
+
+            value_label = QLabel("0", summary_card)
+            value_label.setObjectName(_value_colors.get(key, "DetailSummaryValue"))
+            value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(value_label)
+
+            summary_layout.addLayout(col, stretch=1)
+            self._summary_labels[key] = value_label
+
+        self._summary_card = summary_card
+        self._summary_card.show()
+        summary_and_preview.addWidget(summary_card, 1)
+
+        replay_container = QFrame(self._top_container)
+        replay_layout = QVBoxLayout(replay_container)
+        replay_layout.setContentsMargins(0, 0, 0, 0)
+        replay_layout.setSpacing(0)
+        self._step_replay = StepReplayWidget(replay_container)
+        self._step_replay._open_button.clicked.connect(lambda: self._emit_replay(self._table.currentRow()))
+        replay_layout.addWidget(self._step_replay)
+        summary_and_preview.addWidget(replay_container, 2)
+
+        top_layout.addLayout(summary_and_preview)
+
+        # 테이블 - 기능 중심 컬럼 (Toss 스타일 — 흰 배경 + 중성 헤더)
+        self._table = QTableWidget(self)
+        self._table.setObjectName("DetailTable")
+        self._table.setColumnCount(7)
+        self._table.setHorizontalHeaderLabels(
+            [
+                "테스트 기능",
+                "시나리오",
+                "수행 액션",
+                "비즈니스 영향",
+                "상세",
+                "결과",
+                "재생",
+            ]
+        )
+        header_view = self._table.horizontalHeader()
+        header_view.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header_view.setStretchLastSection(True)
+        header_view.setSectionsMovable(True)
+        header_view.setMinimumSectionSize(100)
+        header_view.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._table.setWordWrap(True)
+        self._table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setShowGrid(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(56)
+        self._table.setAlternatingRowColors(False)
+        self._table.setSortingEnabled(False)
+        # 스타일은 클래스 setStyleSheet에서 일괄 정의 (DetailTable objectName)
+        self._table.cellDoubleClicked.connect(self._open_step_detail)
+        self._table.currentCellChanged.connect(self._preview_step)
+
+        self._content_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self._content_splitter.addWidget(self._top_container)
+        self._content_splitter.addWidget(self._table)
+        self._content_splitter.setStretchFactor(0, 1)
+        self._content_splitter.setStretchFactor(1, 4)
+        self._content_splitter.setSizes([250, 720])
+        layout.addWidget(self._content_splitter, stretch=1)
+
+        self._current_data = None
+        self._current_file_path = None
+        self._top_collapsed = False
+        self._toggle_top_button.setText("미리보기 숨기기")
+
+    def load_result(self, file_path: str):
+        """결과 파일 로드"""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._current_data = data
+            self._current_file_path = file_path
+            self._display_data(data)
+        except Exception as e:
+            print(f"Failed to load result: {e}")
+
+    def _display_data(self, data: Dict):
+        """데이터 표시"""
+        # 요약 업데이트
+        steps = data.get("steps", [])
+        timeline = data.get("step_timeline", [])
+        generic_history = not bool(steps)
+        rows = steps if steps else timeline
+        self._steps = rows
+        self._screenshots_dir = data.get("screenshots_dir")
+        total = len(steps) if steps else int(data.get("total_steps", 0) or len(timeline))
+        success = (
+            sum(1 for s in steps if s.get("success", False))
+            if steps
+            else int(data.get("success_count", 0) or sum(1 for s in timeline if isinstance(s, dict) and s.get("success")))
+        )
+        fail = int(data.get("failed_count", 0) or max(0, total - success))
+        issues = len(data.get("issues_found", [])) or int(data.get("issues_count", 0) or 0)
+        coverage = data.get("coverage", {}).get("coverage_percentage", 0)
+        if not coverage and isinstance(data.get("validation_summary"), dict):
+            coverage = float(data["validation_summary"].get("success_rate", 0) or 0)
+        duration = data.get("duration_seconds", 0)
+
+        self._summary_data = {
+            "total": total,
+            "success": success,
+            "fail": fail,
+            "issues": issues,
+            "coverage": f"{coverage:.0f}%",
+            "duration": f"{duration:.1f}s",
+        }
+        self._summary_labels["total"].setText(str(total))
+        self._summary_labels["success"].setText(str(success))
+        self._summary_labels["fail"].setText(str(fail))
+        self._summary_labels["issues"].setText(str(issues))
+        self._summary_labels["coverage"].setText(f"{coverage:.0f}%")
+        self._summary_labels["duration"].setText(f"{duration:.1f}s")
+
+        # 테이블 업데이트 - 기능 중심
+        self._table.setRowCount(len(rows))
+        self._table.setColumnWidth(0, 170)
+        self._table.setColumnWidth(1, 150)
+        self._table.setColumnWidth(2, 190)
+        self._table.setColumnWidth(3, 150)
+        self._table.setColumnWidth(4, 140)
+        self._table.setColumnWidth(5, 90)
+        self._table.setColumnWidth(6, 110)
+
+        for row, step in enumerate(rows):
+            if generic_history:
+                feature_desc = (
+                    str(step.get("goal") or "").strip()
+                    or str(data.get("current_goal") or "").strip()
+                    or ("완전 자율 탐색" if data.get("mode") == "exploratory" else "빠른 목표 실행")
+                )
+                test_scenario = str(step.get("reasoning") or "").strip() or "-"
+                business_impact = "-"
+                action_detail = str(step.get("action") or "-").strip() or "-"
+                result = "PASS" if step.get("success") else "FAIL"
+                error_msg = str(step.get("error") or "").strip()
+                detail = "성공" if step.get("success") else (error_msg[:20] if error_msg else str(data.get("reason") or "실패")[:20])
+            else:
+                feature_desc = step.get("feature_description", "")
+                test_scenario = step.get("test_scenario", "")
+                business_impact = step.get("business_impact", "")
+
+                decision = step.get("decision", {})
+                action = decision.get("selected_action", {})
+
+                if action:
+                    action_type = action.get("action_type", "")
+                    action_desc = action.get("description", "N/A")
+                    action_detail = f"{action_type}: {action_desc[:30]}"
+                else:
+                    action_detail = "탐색 종료"
+                    if not feature_desc:
+                        feature_desc = "탐색 완료"
+
+                result = "PASS" if step.get("success") else "FAIL"
+                error_msg = step.get("error_message", "")
+                detail = (
+                    "성공"
+                    if step.get("success")
+                    else error_msg[:20]
+                    if error_msg
+                    else "실패"
+                )
+
+            # 테이블에 데이터 설정
+            self._table.setItem(row, 0, QTableWidgetItem(feature_desc or action_detail))
+            self._table.setItem(row, 1, QTableWidgetItem(test_scenario or "-"))
+            self._table.setItem(row, 2, QTableWidgetItem(action_detail))
+            self._table.setItem(
+                row,
+                3,
+                QTableWidgetItem(business_impact or "-"),
+            )
+            self._table.setItem(row, 4, QTableWidgetItem(detail))
+
+            result_item = QTableWidgetItem(result)
+            if result == "PASS":
+                result_item.setBackground(QColor(209, 250, 229))
+                result_item.setForeground(QColor(5, 150, 105))
+            else:
+                result_item.setBackground(QColor(254, 226, 226))
+                result_item.setForeground(QColor(220, 38, 38))
+            result_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row, 5, result_item)
+
+            play_button = QPushButton("재생", self)
+            play_button.setObjectName("GhostButton")
+            play_button.clicked.connect(lambda _, idx=row: self._emit_replay(idx))
+            self._table.setCellWidget(row, 6, play_button)
+
+            for col in range(6):
+                item = self._table.item(row, col)
+                if item:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter)
+                    item.setToolTip(item.text())
+            self._table.setRowHeight(row, 72)
+
+        if len(rows) > 0:
+            self._table.setCurrentCell(0, 0)
+            self._preview_step(0, 0, -1, -1)
+
+    def _open_step_detail(self, row: int, _column: int):
+        """테이블 더블클릭으로 스텝 상세 보기"""
+        if not self._steps or row >= len(self._steps):
+            return
+
+        dialog = StepDetailDialog(
+            self._steps[row],
+            row,
+            screenshots_dir=self._screenshots_dir,
+            parent=self,
+        )
+        dialog.exec()
+
+    def _preview_step(self, row: int, _column: int, _prev_row: int, _prev_col: int):
+        if not self._steps or row < 0 or row >= len(self._steps):
+            return
+        if self._screenshots_dir:
+            self._step_replay.load_step(self._steps[row], self._screenshots_dir)
+        else:
+            self._step_replay.load_step({}, None)
+
+    def _emit_replay(self, row: int):
+        if not self._steps or row < 0 or row >= len(self._steps):
+            return
+        html = self._build_replay_html(self._steps[row])
+        self.replay_requested.emit(html)
+
+    def _toggle_top_section(self):
+        self._top_collapsed = not self._top_collapsed
+        if self._top_collapsed:
+            self._top_container.hide()
+            self._toggle_top_button.setText("미리보기 펼치기")
+            self._content_splitter.setSizes([0, 1])
+        else:
+            self._top_container.show()
+            self._toggle_top_button.setText("미리보기 숨기기")
+            self._content_splitter.setSizes([250, 720])
+
+    def _build_replay_html(self, step_data: Dict) -> str:
+        frames = self._collect_step_frames(step_data)
+        if not frames:
+            return """
+            <html><body style="margin:0; background:#0f172a; color:#cbd5f5; display:flex; align-items:center; justify-content:center; height:100vh;">
+            <div>재생할 이미지가 없습니다</div>
+            </body></html>
+            """
+
+        frame_tags = "".join(
+            [
+                f'<img class="frame" src="{frame}" style="display:none; width:100%; height:auto;"/>'
+                for frame in frames
+            ]
+        )
+
+        return f"""
+        <html>
+        <head>
+            <style>
+                body {{ margin:0; background:#0f172a; color:#e2e8f0; font-family: Arial, sans-serif; }}
+                .wrap {{ display:flex; align-items:center; justify-content:center; height:100vh; flex-direction:column; gap:12px; }}
+                .card {{ width:90%; max-width:860px; background:#111827; border-radius:12px; padding:16px; box-shadow:0 20px 40px rgba(0,0,0,0.35); }}
+                .frame {{ border-radius:8px; }}
+                .label {{ font-size:12px; color:#94a3b8; }}
+            </style>
+        </head>
+        <body>
+            <div class="wrap">
+                <div class="card">
+                    {frame_tags}
+                </div>
+                <div class="label">스텝 재생</div>
+            </div>
+            <script>
+                const frames = document.querySelectorAll('.frame');
+                let index = 0;
+                function show(idx) {{
+                    frames.forEach((frame, i) => frame.style.display = i === idx ? 'block' : 'none');
+                }}
+                if (frames.length) {{
+                    show(0);
+                    setInterval(() => {{
+                        index = (index + 1) % frames.length;
+                        show(index);
+                    }}, 650);
+                }}
+            </script>
+        </body>
+        </html>
+        """
+
+    def _collect_step_frames(self, step_data: Dict) -> List[str]:
+        import base64
+
+        frames: List[str] = []
+        if self._screenshots_dir:
+            step_index = step_data.get("step_number", 0)
+            if step_index:
+                for name in [
+                    f"step_{step_index:03d}_before.png",
+                    f"step_{step_index:03d}_after.png",
+                    f"step_{step_index:03d}.png",
+                ]:
+                    screenshot_path = os.path.join(self._screenshots_dir, name)
+                    if os.path.exists(screenshot_path):
+                        with open(screenshot_path, "rb") as file:
+                            encoded = base64.b64encode(file.read()).decode("utf-8")
+                            data_uri = f"data:image/png;base64,{encoded}"
+                            if data_uri not in frames:
+                                frames.append(data_uri)
+
+        for key in ["screenshot_before", "screenshot_after"]:
+            screenshot_b64 = step_data.get(key)
+            if screenshot_b64:
+                frames.append(f"data:image/png;base64,{screenshot_b64}")
+
+        return frames
+
+    def _export_csv(self):
+        """CSV로 내보내기"""
+        if not self._current_data:
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "CSV 저장", "", "CSV Files (*.csv)"
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", encoding="utf-8-sig") as f:
+                f.write("테스트 기능,시나리오,수행 액션,비즈니스 영향,상세,결과\n")
+                for row in range(self._table.rowCount()):
+                    row_data = []
+                    for col in range(self._table.columnCount()):
+                        item = self._table.item(row, col)
+                        text = item.text() if item else ""
+                        text = text.replace('"', '""')
+                        row_data.append(f'"{text}"')
+                    f.write(",".join(row_data) + "\n")
+            print(f"Exported to {file_path}")
+        except Exception as e:
+            print(f"Export failed: {e}")
+
+
+class ExplorationViewer(QWidget):
+    """탐색 결과 뷰어 메인 위젯"""
+
+    back_requested = Signal()
+    replay_requested = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._results_dir = (
+            Path(__file__).parent.parent.parent.parent
+            / "artifacts"
+            / "exploration_results"
+        )
+        self._setup_ui()
+
+    def _setup_ui(self):
+        # ExplorationViewer 전용 스타일 — 시인성 강화 + Toss design system 통합
+        self.setStyleSheet(
+            """
+            QLabel#HistoryPageTitle {
+                color: #191f28;
+                font-size: 26px;
+                font-weight: 800;
+                letter-spacing: -0.4px;
+                background: transparent;
+            }
+            QLabel#HistoryPageSubtitle {
+                color: #6b7684;
+                font-size: 13px;
+                background: transparent;
+            }
+            QLabel#HistorySectionLabel {
+                color: #191f28;
+                font-size: 13px;
+                font-weight: 700;
+                background: transparent;
+            }
+            QFrame#HistoryStatsCard {
+                background: #ffffff;
+                border: 1px solid #e5e8eb;
+                border-radius: 14px;
+            }
+            QLabel#StatLabel {
+                color: #6b7684; font-size: 11.5px; font-weight: 600; background: transparent;
+            }
+            QLabel#StatValue {
+                color: #191f28; font-size: 22px; font-weight: 800; background: transparent;
+            }
+            QLabel#StatValuePass { color: #1f9d6a; }
+            QLabel#StatValueFail { color: #ef4444; }
+            QLabel#StatValueRate { color: #3a50d2; }
+
+            QFrame#HistoryCard {
+                background: #ffffff;
+                border: 1px solid #e5e8eb;
+                border-radius: 12px;
+            }
+            QFrame#HistoryCard:hover {
+                border: 1.5px solid #c2caf5;
+                background: #f9fbff;
+            }
+            QFrame#HistoryCard[selected="true"] {
+                border: 2px solid #3a50d2;
+                background: #eef1fc;
+            }
+
+            QPushButton#FilterChip {
+                background: #ffffff;
+                border: 1px solid #e5e8eb;
+                border-radius: 999px;
+                color: #6b7684;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 6px 14px;
+                min-height: 0px;
+            }
+            QPushButton#FilterChip:hover {
+                background: #f9fbff;
+                border: 1px solid #c2caf5;
+                color: #2f41b0;
+            }
+            QPushButton#FilterChip[active="true"] {
+                background: #eef1fc;
+                border: 1.5px solid #3a50d2;
+                color: #2f41b0;
+            }
+
+            QLineEdit#HistorySearchInput {
+                background: #ffffff;
+                border: 1px solid #e5e8eb;
+                border-radius: 10px;
+                padding: 9px 14px;
+                color: #191f28;
+                font-size: 13px;
+            }
+            QLineEdit#HistorySearchInput:focus {
+                border: 2px solid #3a50d2;
+                padding: 8px 13px;
+            }
+
+            QFrame#HistoryEmptyState {
+                background: #ffffff;
+                border: 1px solid #e5e8eb;
+                border-radius: 12px;
+            }
+            QLabel#HistoryEmptyIcon {
+                font-size: 32px; color: #3a50d2; background: transparent;
+            }
+            QLabel#HistoryEmptyTitle {
+                color: #191f28; font-size: 15px; font-weight: 700; background: transparent;
+            }
+            QLabel#HistoryEmptyDesc {
+                color: #8b95a1; font-size: 12.5px; background: transparent;
+            }
+            QWidget#HistoryListContainer {
+                background: transparent;
+            }
+            QWidget#HistoryListInner {
+                background: transparent;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        # ─── 헤더 — 제목 + 우측 버튼 ─────────────────────────────────
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
+        top_row.setContentsMargins(0, 0, 0, 0)
+        title_block = QVBoxLayout()
+        title_block.setSpacing(4)
+        title_block.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("테스트 히스토리", self)
+        title.setObjectName("HistoryPageTitle")
+        title_block.addWidget(title)
+        subtitle = QLabel("지난 테스트 실행 결과와 통계를 확인하세요.", self)
+        subtitle.setObjectName("HistoryPageSubtitle")
+        title_block.addWidget(subtitle)
+        top_row.addLayout(title_block)
+        top_row.addStretch(1)
+        back_button = QPushButton("← 사이트 선택으로", self)
+        back_button.setObjectName("GhostButton")
+        back_button.clicked.connect(self.back_requested.emit)
+        top_row.addWidget(back_button)
+        refresh_button = QPushButton("새로고침", self)
+        refresh_button.setObjectName("GhostButton")
+        refresh_button.clicked.connect(self.refresh_results)
+        top_row.addWidget(refresh_button)
+        layout.addLayout(top_row)
+
+        # ─── 통계 카드 (4 메트릭) ──────────────────────────────────
+        self._stats_card = QFrame(self)
+        self._stats_card.setObjectName("HistoryStatsCard")
+        stats_layout = QHBoxLayout(self._stats_card)
+        stats_layout.setContentsMargins(20, 16, 20, 16)
+        stats_layout.setSpacing(0)
+
+        self._stat_total_value = QLabel("0", self._stats_card)
+        self._stat_total_value.setObjectName("StatValue")
+        self._stat_total_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._stat_success_value = QLabel("0", self._stats_card)
+        self._stat_success_value.setObjectName("StatValue")
+        self._stat_success_value.setProperty("class", "pass")
+        self._stat_success_value.setStyleSheet("color: #1f9d6a; font-size: 22px; font-weight: 800; background: transparent;")
+        self._stat_success_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._stat_fail_value = QLabel("0", self._stats_card)
+        self._stat_fail_value.setStyleSheet("color: #ef4444; font-size: 22px; font-weight: 800; background: transparent;")
+        self._stat_fail_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._stat_rate_value = QLabel("0%", self._stats_card)
+        self._stat_rate_value.setStyleSheet("color: #3a50d2; font-size: 22px; font-weight: 800; background: transparent;")
+        self._stat_rate_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        for idx, (val_widget, label_text) in enumerate([
+            (self._stat_total_value, "전체 실행"),
+            (self._stat_success_value, "성공"),
+            (self._stat_fail_value, "실패"),
+            (self._stat_rate_value, "성공률"),
+        ]):
+            if idx > 0:
+                divider = QFrame(self._stats_card)
+                divider.setStyleSheet("background: #f2f4f6;")
+                divider.setFixedWidth(1)
+                divider.setMaximumHeight(48)
+                stats_layout.addWidget(divider, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+            col = QVBoxLayout()
+            col.setSpacing(4)
+            col.setContentsMargins(0, 0, 0, 0)
+            lbl = QLabel(label_text, self._stats_card)
+            lbl.setObjectName("StatLabel")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(lbl)
+            col.addWidget(val_widget)
+            stats_layout.addLayout(col, stretch=1)
+
+        layout.addWidget(self._stats_card)
+
+        # ─── 필터 + 검색 ───────────────────────────────────────────
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        filter_row.setContentsMargins(0, 0, 0, 0)
+
+        self._filter_buttons: dict[str, QPushButton] = {}
+        for key, label in (("all", "전체"), ("success", "성공"), ("failed", "실패"), ("blocked", "차단/이슈")):
+            btn = QPushButton(label, self)
+            btn.setObjectName("FilterChip")
+            btn.setProperty("active", key == "all")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _checked=False, k=key: self._set_filter(k))
+            filter_row.addWidget(btn)
+            self._filter_buttons[key] = btn
+
+        filter_row.addStretch(1)
+
+        self._search_input = QLineEdit(self)
+        self._search_input.setObjectName("HistorySearchInput")
+        self._search_input.setPlaceholderText("URL 또는 사유 검색")
+        self._search_input.setMaximumWidth(280)
+        self._search_input.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self._search_input)
+
+        layout.addLayout(filter_row)
+
+        # ─── 메인 컨텐츠 (좌측 리스트 + 우측 디테일) ────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+
+        list_container = QWidget(splitter)
+        list_container.setObjectName("HistoryListContainer")
+        list_container.setMinimumWidth(280)  # 좁은 윈도우에서도 list 충분히 넓게 유지
+        list_layout = QVBoxLayout(list_container)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(10)
+
+        list_label_row = QHBoxLayout()
+        list_label_row.setSpacing(8)
+        list_label = QLabel("실행 기록", list_container)
+        list_label.setObjectName("HistorySectionLabel")
+        list_label_row.addWidget(list_label)
+        self._list_count_label = QLabel("0", list_container)
+        self._list_count_label.setStyleSheet(
+            "background: #eef1fc; color: #3a50d2; padding: 2px 10px; "
+            "border-radius: 999px; font-size: 10.5px; font-weight: 800;"
+        )
+        list_label_row.addWidget(self._list_count_label)
+        list_label_row.addStretch(1)
+        list_layout.addLayout(list_label_row)
+
+        scroll = QScrollArea(list_container)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+
+        self._list_widget = QWidget(scroll)
+        self._list_widget.setObjectName("HistoryListInner")
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setContentsMargins(0, 0, 8, 0)
+        self._list_layout.setSpacing(10)
+        # 빈 상태 placeholder (필요 시 동적으로 추가/제거)
+        self._empty_state_widget: QFrame | None = None
+        self._list_layout.addStretch(1)
+
+        scroll.setWidget(self._list_widget)
+        list_layout.addWidget(scroll, stretch=1)
+        splitter.addWidget(list_container)
+
+        # 우측 디테일 뷰
+        self._detail_view = ExplorationDetailView(splitter)
+        self._detail_view.setMinimumWidth(420)  # detail 패널 좁게 안 되도록
+        self._detail_view.replay_requested.connect(self.replay_requested.emit)
+        splitter.addWidget(self._detail_view)
+
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 0)  # list — 고정 비율 (setSizes 우선)
+        splitter.setStretchFactor(1, 1)  # detail — 남는 공간 흡수
+        splitter.setSizes([360, 700])
+        splitter.setHandleWidth(8)
+        layout.addWidget(splitter, stretch=1)
+
+        # 내부 상태
+        self._current_filter: str = "all"
+        self._all_cards: list[ExplorationResultCard] = []
+        self._selected_card: ExplorationResultCard | None = None
+
+        # 초기 로드
+        self.refresh_results()
+
+    def _set_filter(self, key: str) -> None:
+        self._current_filter = key
+        for k, btn in self._filter_buttons.items():
+            btn.setProperty("active", k == key)
+            style = btn.style()
+            if style is not None:
+                style.unpolish(btn); style.polish(btn); btn.update()
+        self._apply_filter()
+
+    def _apply_filter(self, *_args) -> None:
+        """현재 필터 + 검색어에 따라 카드 visibility 조정."""
+        query = (self._search_input.text() if hasattr(self, "_search_input") else "").strip().lower()
+        visible_count = 0
+        for card in self._all_cards:
+            summary_url = ""
+            summary_reason = ""
+            # card에 저장된 메타데이터로 필터
+            status_dot = getattr(card, "_history_status", "unknown")
+            try:
+                # _list_layout에서 카드의 인덱스/메타는 widget 자체에 저장된 속성으로 조회
+                summary_url = getattr(card, "_history_url", "").lower()
+                summary_reason = getattr(card, "_history_reason", "").lower()
+            except Exception:
+                pass
+
+            # filter 매칭
+            filter_match = (
+                self._current_filter == "all"
+                or (self._current_filter == "success" and status_dot == "success")
+                or (self._current_filter == "failed" and status_dot == "failed")
+                or (self._current_filter == "blocked" and status_dot == "blocked")
+            )
+            # 검색어 매칭
+            query_match = (not query) or (query in summary_url) or (query in summary_reason)
+
+            if filter_match and query_match:
+                card.setVisible(True)
+                visible_count += 1
+            else:
+                card.setVisible(False)
+
+        self._list_count_label.setText(str(visible_count))
+        self._update_empty_state(visible_count == 0)
+
+    def _update_empty_state(self, show: bool) -> None:
+        """빈 상태 placeholder 토글."""
+        if show and self._empty_state_widget is None:
+            self._empty_state_widget = QFrame(self._list_widget)
+            self._empty_state_widget.setObjectName("HistoryEmptyState")
+            # 좁은 splitter pane(예: 200px)에서도 부모 폭에 맞춰 줄어들도록
+            self._empty_state_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            self._empty_state_widget.setMinimumWidth(0)
+            v = QVBoxLayout(self._empty_state_widget)
+            v.setContentsMargins(20, 28, 20, 28)
+            v.setSpacing(10)
+            v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon = QLabel("◷", self._empty_state_widget)
+            icon.setObjectName("HistoryEmptyIcon")
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            v.addWidget(icon)
+            title = QLabel("실행 기록이 없습니다", self._empty_state_widget)
+            title.setObjectName("HistoryEmptyTitle")
+            title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            title.setWordWrap(True)
+            v.addWidget(title)
+            # 짧고 자연스럽게 wrap되는 문구로 변경 (긴 화살표 시퀀스 제거)
+            desc = QLabel(
+                "새 테스트를 시작하면 결과가 여기에 표시됩니다.",
+                self._empty_state_widget,
+            )
+            desc.setObjectName("HistoryEmptyDesc")
+            desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            desc.setWordWrap(True)
+            desc.setMinimumWidth(0)
+            v.addWidget(desc)
+            # stretch 직전 위치에 삽입
+            self._list_layout.insertWidget(max(0, self._list_layout.count() - 1), self._empty_state_widget)
+        elif not show and self._empty_state_widget is not None:
+            self._empty_state_widget.deleteLater()
+            self._empty_state_widget = None
+
+    def refresh_results(self):
+        """결과 목록 새로고침 — 통계 카드 + 필터 가능한 카드 리스트."""
+        # 기존 카드 제거 (empty_state 위젯도 함께)
+        while self._list_layout.count() > 0:
+            item = self._list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._empty_state_widget = None
+        self._all_cards = []
+        self._selected_card = None
+        self._list_layout.addStretch(1)
+
+        # 결과 파일 로드
+        if not self._results_dir.exists():
+            self._results_dir.mkdir(parents=True, exist_ok=True)
+
+        files: list[Path] = []
+        if self._results_dir.exists():
+            files = list(self._results_dir.glob("exploration_*.json"))
+            files.extend(self._results_dir.glob("execution_*.json"))
+            files = sorted(set(files), key=lambda x: x.stat().st_mtime, reverse=True)
+
+        # 통계 집계용
+        total_runs = 0
+        success_runs = 0
+        fail_runs = 0
+        blocked_runs = 0
+
+        for file_path in files[:40]:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                steps = data.get("steps", [])
+                timeline = data.get("step_timeline", [])
+                gif_path = data.get("recording_gif_path")
+                total_steps = len(steps) if steps else int(data.get("total_steps", 0) or len(timeline))
+                success_count = (
+                    sum(1 for s in steps if s.get("success", False))
+                    if steps
+                    else int(data.get("success_count", 0) or sum(1 for s in timeline if isinstance(s, dict) and s.get("success")))
+                )
+                issues_count = len(data.get("issues_found", [])) or int(data.get("issues_count", 0) or 0)
+                status_text = str(data.get("status") or "").lower().strip()
+                reason_text = str(data.get("reason") or data.get("blocked_reason") or "").strip()
+
+                # 상태 정규화 (카드/통계용)
+                if status_text in ("success", "passed", "ok"):
+                    canonical_status = "success"
+                elif status_text in ("failed", "fail", "error"):
+                    canonical_status = "failed"
+                elif "blocked" in status_text or issues_count > 0:
+                    canonical_status = "blocked"
+                else:
+                    # 통계로 추정 — 성공이 우세하면 성공으로
+                    fail_count_from_steps = max(0, total_steps - success_count)
+                    if fail_count_from_steps > 0:
+                        canonical_status = "failed"
+                    elif success_count > 0:
+                        canonical_status = "success"
+                    else:
+                        canonical_status = "unknown"
+
+                total_runs += 1
+                if canonical_status == "success":
+                    success_runs += 1
+                elif canonical_status == "failed":
+                    fail_runs += 1
+                elif canonical_status == "blocked":
+                    blocked_runs += 1
+
+                summary = {
+                    "timestamp": datetime.fromtimestamp(file_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                    "start_url": data.get("start_url", "Unknown"),
+                    "total_steps": total_steps,
+                    "success_count": success_count,
+                    "issues_count": issues_count,
+                    "has_gif": gif_path and os.path.exists(gif_path),
+                    "mode": str(data.get("mode") or "exploration"),
+                    "status": canonical_status,
+                    "reason": reason_text,
+                }
+
+                card = ExplorationResultCard(str(file_path), summary, self._list_widget)
+                card.clicked.connect(self._on_card_clicked)
+                # 필터/검색용 메타데이터 저장
+                card._history_status = canonical_status  # type: ignore[attr-defined]
+                card._history_url = str(summary["start_url"]).lower()  # type: ignore[attr-defined]
+                card._history_reason = reason_text.lower()  # type: ignore[attr-defined]
+                self._list_layout.insertWidget(self._list_layout.count() - 1, card)
+                self._all_cards.append(card)
+
+            except Exception as e:
+                print(f"Failed to load {file_path}: {e}")
+
+        # 통계 카드 갱신
+        self._stat_total_value.setText(str(total_runs))
+        self._stat_success_value.setText(str(success_runs))
+        self._stat_fail_value.setText(str(fail_runs + blocked_runs))
+        success_rate = (success_runs / total_runs * 100.0) if total_runs else 0.0
+        self._stat_rate_value.setText(f"{success_rate:.0f}%")
+
+        # 카운트 + 필터 적용 (검색어가 비어있으면 모든 카드 visible)
+        self._apply_filter()
+
+        # 첫 번째 카드 자동 선택
+        if self._all_cards:
+            first = self._all_cards[0]
+            first.set_selected(True)
+            self._selected_card = first
+            self._detail_view.load_result(first.file_path)
+
+    def _on_card_clicked(self, file_path: str):
+        """카드 클릭 처리 — 선택 상태 갱신 + 디테일 뷰 로드."""
+        # 이전 선택 해제
+        if self._selected_card is not None:
+            self._selected_card.set_selected(False)
+        # 새 선택 표시
+        for card in self._all_cards:
+            if card.file_path == file_path:
+                card.set_selected(True)
+                self._selected_card = card
+                break
+        self._detail_view.load_result(file_path)

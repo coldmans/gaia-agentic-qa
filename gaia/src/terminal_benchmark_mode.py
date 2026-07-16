@@ -1,0 +1,2476 @@
+"""Terminal-only interactive benchmark mode helpers."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+from gaia.src.benchmark_manager import (
+    BenchmarkPreset,
+    append_scenario_to_suite,
+    build_benchmark_site_catalog,
+    build_scenario_labels,
+    build_scenario_payload,
+    build_single_scenario_suite_payload,
+    build_url_history,
+    create_custom_site_definition,
+    create_custom_suite_payload,
+    default_scenario_name,
+    delete_custom_benchmark_site,
+    delete_scenario_from_suite,
+    extract_url_host,
+    find_preset,
+    generate_scenario_id,
+    load_benchmark_registry,
+    load_suite_payload,
+    override_suite_urls,
+    prune_benchmark_reports,
+    render_benchmark_reports_html,
+    replace_scenario_in_suite,
+    resolve_benchmark_site,
+    save_benchmark_registry,
+    save_suite_payload,
+    scan_benchmark_reports,
+    upsert_benchmark_site_url,
+    upsert_custom_benchmark_site,
+)
+from gaia.src.benchmark_suite_sharing import (
+    SharedSuiteError,
+    SharedSuiteNotFound,
+    download_shared_suite,
+    merge_shared_suite_payload,
+    upload_shared_suite,
+)
+from gaia.src.phase4.goal_driven.adaptive_qa_runtime import (
+    ADAPTIVE_QA_MODE,
+    DEEP_ADAPTIVE_QA_MODE,
+)
+from scripts.runner_identity import resolve_runner_id
+
+PromptSelectFn = Callable[[str, Sequence[str], str | None], str]
+PromptTextFn = Callable[[str, str | None], str]
+OutputFn = Callable[[str], None]
+ProcessFactory = Callable[..., subprocess.Popen[str]]
+ReportOpener = Callable[[str], bool]
+GrafanaOpener = Callable[[str], bool]
+ScenarioFormOpener = Callable[..., Mapping[str, Any] | None]
+RecordPruner = Callable[..., Mapping[str, Any]]
+CatalogOverride = (
+    tuple[list[dict[str, Any]], dict[str, BenchmarkPreset]]
+    | Callable[[Mapping[str, Any]], tuple[list[dict[str, Any]], dict[str, BenchmarkPreset]]]
+)
+
+ALL_SITES_ALL_CASES_OPTION = "전체사이트 전체케이스 실행"
+EXTERNAL_PUBLIC_MANIFEST_PATH = Path("gaia/tests/scenarios/external_public_manifest.json")
+DEEP_QA_ALL_CASES_OPTION = "Deep QA 전체케이스 실행"
+DEEP_QA_BENCHMARK_MANIFEST_PATH = Path("gaia/tests/scenarios/deep_qa_benchmark_manifest.json")
+HUMAN_VS_GAIA_MANIFEST_PATH = Path("gaia/tests/scenarios/gaia_vs_human_manifest.json")
+BATTLE_DEFAULT_SITE_URL = "https://gaia-battle-web.vercel.app"
+BATTLE_DEFAULT_SESSION_ID = "battle-live"
+SITE_ADD_OPTION = "사이트 추가"
+SITE_EDIT_OPTION = "사이트 수정"
+SITE_DELETE_OPTION = "사이트 삭제"
+SITE_EXIT_OPTION = "종료"
+PUSH_METRICS_OPTION = "업로드하기"
+LOCAL_METRICS_OPTION = "로컬만 저장"
+CONNECT_MONITORING_OPTION = "지금 연결하기"
+SHOW_CONNECT_COMMAND_OPTION = "연결 명령 보기"
+GRAFANA_METRICS_OPTION = "Grafana 열기"
+LOCAL_REPORT_OPTION = "로컬 결과 보기"
+DELETE_FAILED_REPORTS_OPTION = "실패 기록 삭제"
+CONFIRM_DELETE_FAILED_REPORTS_OPTION = "삭제하기"
+METRICS_BACK_OPTION = "이전으로"
+SHARE_TESTS_OPTION = "팀 테스트 공유"
+UPLOAD_SHARED_TESTS_OPTION = "내 테스트 올리기"
+PULL_SHARED_TESTS_OPTION = "팀 테스트 가져오기"
+BENCHMARK_QA_MODE_CHOICES = {
+    "adaptive": ADAPTIVE_QA_MODE,
+    ADAPTIVE_QA_MODE: ADAPTIVE_QA_MODE,
+    "progressive_qa": ADAPTIVE_QA_MODE,
+    "deep": DEEP_ADAPTIVE_QA_MODE,
+    "deep_qa": DEEP_ADAPTIVE_QA_MODE,
+    "aggressive_qa": DEEP_ADAPTIVE_QA_MODE,
+    DEEP_ADAPTIVE_QA_MODE: DEEP_ADAPTIVE_QA_MODE,
+}
+HUMAN_VS_GAIA_RUN_ALL_OPTION = "전체 사이트 전체 테스트 실행"
+HUMAN_VS_GAIA_SKIP_SITE_KEYS = frozenset({"inu_lms_hvh"})
+
+
+@dataclass(frozen=True)
+class BattleWebConfig:
+    site_url: str
+    upload_url: str
+    session_id: str
+    upload_token: str = ""
+
+
+def build_terminal_benchmark_catalog(
+    payload: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, BenchmarkPreset]]:
+    return build_benchmark_site_catalog(payload)
+
+
+def build_deep_qa_benchmark_catalog(
+    *,
+    workspace_root: Path,
+    manifest_path: Path | str = DEEP_QA_BENCHMARK_MANIFEST_PATH,
+) -> tuple[list[dict[str, Any]], dict[str, BenchmarkPreset]]:
+    resolved = (workspace_root / manifest_path).resolve()
+    try:
+        manifest = json.loads(resolved.read_text(encoding="utf-8"))
+    except Exception:
+        return [], {}
+    suites = manifest.get("suites") if isinstance(manifest, Mapping) else []
+    if not isinstance(suites, list):
+        return [], {}
+
+    catalog: list[dict[str, Any]] = []
+    preset_map: dict[str, BenchmarkPreset] = {}
+    for index, raw in enumerate(suites, start=1):
+        if not isinstance(raw, Mapping):
+            continue
+        suite_path = str(raw.get("suite_path") or "").strip()
+        if not suite_path:
+            continue
+        site_key = str(raw.get("site_key") or raw.get("key") or "").strip()
+        if not site_key:
+            site_key = f"deep_qa_{index:02d}"
+        label = str(raw.get("label") or raw.get("name") or site_key).strip()
+        base_url = str(raw.get("base_url") or "").strip()
+        host_aliases = tuple(
+            str(item).strip().lower()
+            for item in list(raw.get("host_aliases") or [])
+            if str(item).strip()
+        )
+        if not host_aliases:
+            host = extract_url_host(base_url)
+            host_aliases = tuple(filter(None, (host,)))
+        preset = BenchmarkPreset(
+            key=site_key,
+            label=label,
+            default_url=base_url,
+            suite_path=suite_path,
+            host_aliases=host_aliases,
+        )
+        preset_map[site_key] = preset
+        catalog.append(
+            {
+                "key": site_key,
+                "label": label,
+                "default_url": base_url,
+                "urls": [base_url] if base_url else [],
+                "suite_path": suite_path,
+                "suite_available": bool((workspace_root / suite_path).exists()),
+                "status_text": "Deep QA 전용",
+                "is_custom": False,
+                "is_deep_qa": True,
+            }
+        )
+    return catalog, preset_map
+
+
+def build_human_vs_gaia_catalog(
+    payload: Mapping[str, Any],
+    *,
+    workspace_root: Path,
+    manifest_path: Path | str = HUMAN_VS_GAIA_MANIFEST_PATH,
+) -> tuple[list[dict[str, Any]], dict[str, BenchmarkPreset], dict[str, set[str]]]:
+    resolved_manifest = (workspace_root / Path(manifest_path)).resolve()
+    try:
+        manifest_payload = json.loads(resolved_manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [], {}, {}
+    if not isinstance(manifest_payload, Mapping):
+        return [], {}, {}
+    sites = payload.get("sites") if isinstance(payload.get("sites"), Mapping) else {}
+    catalog: list[dict[str, Any]] = []
+    preset_map: dict[str, BenchmarkPreset] = {}
+    scenario_filter_map: dict[str, set[str]] = {}
+
+    for raw in list(manifest_payload.get("sites") or []):
+        if not isinstance(raw, Mapping):
+            continue
+        site_key = str(raw.get("site_key") or "").strip()
+        label = str(raw.get("label") or "").strip()
+        default_url = str(raw.get("default_url") or "").strip()
+        suite_path = str(raw.get("suite_path") or "").strip()
+        allowed_scenarios = {
+            str(item).strip()
+            for item in list(raw.get("allowed_scenarios") or [])
+            if str(item).strip()
+        }
+        host_aliases = tuple(
+            str(item).strip().lower()
+            for item in list(raw.get("host_aliases") or [])
+            if str(item).strip()
+        )
+        if not site_key or not label or not default_url or not suite_path or not allowed_scenarios:
+            continue
+
+        current = sites.get(site_key) if isinstance(sites, Mapping) else {}
+        current = current if isinstance(current, Mapping) else {}
+        registry_urls = [str(current.get("default_url") or "").strip()]
+        registry_urls.extend(list(current.get("urls") or []))
+        urls = build_url_history(
+            {
+                "default_url": default_url,
+                "urls": registry_urls,
+            }
+        )
+
+        preset = BenchmarkPreset(
+            key=site_key,
+            label=label,
+            default_url=default_url,
+            suite_path=suite_path,
+            host_aliases=host_aliases or tuple(filter(None, (extract_url_host(default_url),))),
+        )
+        preset_map[site_key] = preset
+        scenario_filter_map[site_key] = allowed_scenarios
+        catalog.append(
+            {
+                "key": site_key,
+                "label": label,
+                "default_url": urls[0] if urls else default_url,
+                "urls": urls[:8],
+                "suite_path": suite_path,
+                "suite_available": True,
+                "status_text": f"GAIA_VS_HUMAN {len(allowed_scenarios)}개",
+                "is_custom": True,
+            }
+        )
+
+    return catalog, preset_map, scenario_filter_map
+
+
+def _filter_suite_payload_for_allowed_scenarios(
+    suite_payload: Mapping[str, Any],
+    allowed_scenarios: set[str] | None,
+) -> dict[str, Any]:
+    if not allowed_scenarios:
+        return dict(suite_payload)
+    filtered = dict(suite_payload)
+    filtered["scenarios"] = [
+        dict(row)
+        for row in list(suite_payload.get("scenarios") or [])
+        if isinstance(row, Mapping) and str(row.get("id") or "").strip() in allowed_scenarios
+    ]
+    return filtered
+
+
+def normalize_benchmark_qa_mode(value: str | None) -> str | None:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "off", "none", "default", "false", "0"}:
+        return None
+    return BENCHMARK_QA_MODE_CHOICES.get(raw)
+
+
+def benchmark_qa_mode_label(value: str | None) -> str:
+    normalized = normalize_benchmark_qa_mode(value)
+    if normalized == DEEP_ADAPTIVE_QA_MODE:
+        return "Deep QA"
+    if normalized == ADAPTIVE_QA_MODE:
+        return "QA 확장"
+    return "기본"
+
+
+def benchmark_qa_mode_run_tag(value: str | None, run_tag: str) -> str:
+    normalized = normalize_benchmark_qa_mode(value)
+    if normalized == DEEP_ADAPTIVE_QA_MODE:
+        return f"deep_qa_{run_tag}"
+    if normalized == ADAPTIVE_QA_MODE:
+        return f"adaptive_qa_{run_tag}"
+    return run_tag
+
+
+def prompt_scenario_fields(
+    *,
+    prompt_select: PromptSelectFn,
+    prompt: PromptTextFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    existing: Mapping[str, Any] | None = None,
+    existing_ids: set[str] | None = None,
+    default_url: str = "",
+) -> dict[str, Any]:
+    del prompt_select, prompt
+    current = dict(existing or {})
+    reserved_ids = {str(item).strip() for item in (existing_ids or set()) if str(item).strip()}
+    current_id = str(current.get("id") or "").strip()
+    if current_id:
+        reserved_ids.discard(current_id)
+
+    test_name = str(
+        prompt_non_empty(
+            "테스트 이름",
+            default=default_scenario_name(current) or None,
+        )
+    ).strip()
+    scenario_id = current_id or generate_scenario_id(
+        test_name=test_name,
+        existing_ids=reserved_ids,
+        default_url=str(current.get("url") or default_url or "").strip(),
+    )
+
+    url = str(
+        prompt_non_empty(
+            "url",
+            default=str(current.get("url") or default_url or "").strip() or None,
+        )
+    ).strip()
+    goal = str(prompt_non_empty("goal", default=str(current.get("goal") or "").strip() or None)).strip()
+    time_budget_default = str(current.get("time_budget_sec") or 300)
+    while True:
+        time_budget_raw = str(prompt_non_empty("time_budget_sec", default=time_budget_default)).strip()
+        try:
+            time_budget_sec = max(1, int(time_budget_raw))
+            break
+        except Exception:
+            emit("time_budget_sec는 1 이상의 정수여야 합니다.")
+
+    scenario = build_scenario_payload(
+        current=current,
+        test_name=test_name,
+        url=url,
+        goal=goal,
+        time_budget_sec=time_budget_sec,
+        existing_ids=reserved_ids,
+    )
+    scenario["id"] = scenario_id
+    return scenario
+
+
+def _applescript_quote(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _prompt_macos_dialog(
+    *,
+    title: str,
+    field_label: str,
+    default: str,
+    hidden: bool = False,
+) -> str | None:
+    prompt_text = _applescript_quote(field_label)
+    title_text = _applescript_quote(title)
+    default_text = _applescript_quote(default)
+    hidden_flag = " with hidden answer" if hidden else ""
+    script = (
+        f'text returned of (display dialog "{prompt_text}" '
+        f'default answer "{default_text}" with title "{title_text}"{hidden_flag})'
+    )
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        stderr = f"{proc.stderr or ''} {proc.stdout or ''}".lower()
+        if "user canceled" in stderr or "cancel" in stderr:
+            return None
+        raise RuntimeError((proc.stderr or proc.stdout or "osascript dialog failed").strip())
+    return str(proc.stdout or "").strip()
+
+
+def _powershell_quote(value: str) -> str:
+    return str(value or "").replace("'", "''")
+
+
+def _find_windows_shell() -> str:
+    for candidate in ("powershell", "pwsh"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise RuntimeError("powershell 또는 pwsh를 찾을 수 없습니다.")
+
+
+def _prompt_windows_dialog(
+    *,
+    title: str,
+    field_label: str,
+    default: str,
+) -> str | None:
+    shell = _find_windows_shell()
+    title_text = _powershell_quote(title)
+    prompt_text = _powershell_quote(field_label)
+    default_text = _powershell_quote(default)
+    script = f"""
+Add-Type -AssemblyName Microsoft.VisualBasic
+$value = [Microsoft.VisualBasic.Interaction]::InputBox('{prompt_text}', '{title_text}', '{default_text}')
+if ($value -eq $null) {{ exit 1 }}
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Write-Output $value
+""".strip()
+    proc = subprocess.run(
+        [shell, "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        stderr = f"{proc.stderr or ''} {proc.stdout or ''}".lower()
+        if "cancel" in stderr or "canceled" in stderr:
+            return None
+        raise RuntimeError((proc.stderr or proc.stdout or "powershell dialog failed").strip())
+    return str(proc.stdout or "").rstrip("\r\n")
+
+
+def open_scenario_form_windows_dialogs(
+    *,
+    emit: OutputFn,
+    existing: Mapping[str, Any] | None = None,
+    existing_ids: set[str] | None = None,
+    default_url: str = "",
+    title: str = "새 테스트 추가",
+) -> dict[str, Any] | None:
+    del emit
+    current = dict(existing or {})
+    name_default = default_scenario_name(current)
+    url_default = str(current.get("url") or default_url or "").strip()
+    goal_default = str(current.get("goal") or "").strip()
+    timeout_default = str(current.get("time_budget_sec") or 300)
+
+    test_name = _prompt_windows_dialog(title=title, field_label="테스트 이름", default=name_default)
+    if test_name is None:
+        return None
+    test_name = test_name.strip()
+    if not test_name:
+        raise ValueError("테스트 이름을 입력해주세요.")
+
+    url = _prompt_windows_dialog(title=title, field_label="url", default=url_default)
+    if url is None:
+        return None
+    url = url.strip()
+    if not url:
+        raise ValueError("url을 입력해주세요.")
+
+    goal = _prompt_windows_dialog(title=title, field_label="goal", default=goal_default)
+    if goal is None:
+        return None
+    goal = goal.strip()
+    if not goal:
+        raise ValueError("goal을 입력해주세요.")
+
+    timeout_raw = _prompt_windows_dialog(title=title, field_label="time_budget_sec", default=timeout_default)
+    if timeout_raw is None:
+        return None
+    try:
+        time_budget_sec = max(1, int(str(timeout_raw).strip()))
+    except Exception as exc:
+        raise ValueError("time_budget_sec는 1 이상의 정수여야 합니다.") from exc
+
+    return build_scenario_payload(
+        current=current,
+        test_name=test_name,
+        url=url,
+        goal=goal,
+        time_budget_sec=time_budget_sec,
+        existing_ids=set(existing_ids or set()),
+    )
+
+
+def _open_scenario_form_pyside_inline(
+    *,
+    emit: OutputFn,
+    existing: Mapping[str, Any] | None = None,
+    existing_ids: set[str] | None = None,
+    default_url: str = "",
+    title: str = "새 테스트 추가",
+) -> dict[str, Any] | None:
+    del emit
+    current = dict(existing or {})
+    try:
+        from PySide6.QtWidgets import (
+            QApplication,
+            QDialog,
+            QDialogButtonBox,
+            QFormLayout,
+            QLineEdit,
+            QMessageBox,
+            QTextEdit,
+            QVBoxLayout,
+            QWidget,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"PySide6를 불러오지 못했습니다: {exc}") from exc
+
+    app = QApplication.instance()
+    created_app = False
+    if app is None:
+        app = QApplication([])
+        created_app = True
+
+    dialog = QDialog(None)
+    dialog.setWindowTitle(title)
+    dialog.resize(640, 320)
+
+    layout = QVBoxLayout(dialog)
+    form_layout = QFormLayout()
+    layout.addLayout(form_layout)
+
+    name_input = QLineEdit(default_scenario_name(current), dialog)
+    url_input = QLineEdit(str(current.get("url") or default_url or "").strip(), dialog)
+    goal_input = QTextEdit(dialog)
+    goal_input.setPlainText(str(current.get("goal") or "").strip())
+    timeout_input = QLineEdit(str(current.get("time_budget_sec") or 300), dialog)
+
+    form_layout.addRow("테스트 이름", name_input)
+    form_layout.addRow("url", url_input)
+    form_layout.addRow("goal", goal_input)
+    form_layout.addRow("time_budget_sec", timeout_input)
+
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+        parent=dialog,
+    )
+    layout.addWidget(buttons)
+    result: dict[str, Any] | None = None
+
+    def _show_error(message: str, widget: QWidget | None = None) -> None:
+        QMessageBox.warning(dialog, "입력 오류", message)
+        if widget is not None:
+            widget.setFocus()
+
+    def _validate_and_accept() -> None:
+        nonlocal result
+        test_name = name_input.text().strip()
+        url = url_input.text().strip()
+        goal = goal_input.toPlainText().strip()
+        timeout_raw = timeout_input.text().strip()
+        if not test_name:
+            _show_error("테스트 이름을 입력해주세요.", name_input)
+            return
+        if not url:
+            _show_error("url을 입력해주세요.", url_input)
+            return
+        if not goal:
+            _show_error("goal을 입력해주세요.", goal_input)
+            return
+        try:
+            parsed = max(1, int(timeout_raw))
+        except Exception:
+            _show_error("time_budget_sec는 1 이상의 정수여야 합니다.", timeout_input)
+            return
+        result = build_scenario_payload(
+            current=current,
+            test_name=test_name,
+            url=url,
+            goal=goal,
+            time_budget_sec=parsed,
+            existing_ids=set(existing_ids or set()),
+        )
+        dialog.accept()
+
+    buttons.accepted.connect(_validate_and_accept)
+    buttons.rejected.connect(dialog.reject)
+    name_input.setFocus()
+
+    try:
+        accepted = dialog.exec() == int(QDialog.DialogCode.Accepted)
+        if not accepted:
+            return None
+        return dict(result) if isinstance(result, Mapping) else None
+    finally:
+        try:
+            dialog.hide()
+            dialog.close()
+        except Exception:
+            pass
+        try:
+            dialog.deleteLater()
+        except Exception:
+            pass
+        if created_app:
+            try:
+                app.processEvents()
+                app.closeAllWindows()
+                app.quit()
+                app.processEvents()
+            except Exception:
+                pass
+
+
+def open_scenario_form_macos_dialogs(
+    *,
+    emit: OutputFn,
+    existing: Mapping[str, Any] | None = None,
+    existing_ids: set[str] | None = None,
+    default_url: str = "",
+    title: str = "새 테스트 추가",
+) -> dict[str, Any] | None:
+    del emit
+    current = dict(existing or {})
+    name_default = default_scenario_name(current)
+    url_default = str(current.get("url") or default_url or "").strip()
+    goal_default = str(current.get("goal") or "").strip()
+    timeout_default = str(current.get("time_budget_sec") or 300)
+
+    test_name = _prompt_macos_dialog(title=title, field_label="테스트 이름", default=name_default)
+    if test_name is None:
+        return None
+    test_name = test_name.strip()
+    if not test_name:
+        raise ValueError("테스트 이름을 입력해주세요.")
+
+    url = _prompt_macos_dialog(title=title, field_label="url", default=url_default)
+    if url is None:
+        return None
+    url = url.strip()
+    if not url:
+        raise ValueError("url을 입력해주세요.")
+
+    goal = _prompt_macos_dialog(title=title, field_label="goal", default=goal_default)
+    if goal is None:
+        return None
+    goal = goal.strip()
+    if not goal:
+        raise ValueError("goal을 입력해주세요.")
+
+    timeout_raw = _prompt_macos_dialog(title=title, field_label="time_budget_sec", default=timeout_default)
+    if timeout_raw is None:
+        return None
+    try:
+        time_budget_sec = max(1, int(str(timeout_raw).strip()))
+    except Exception as exc:
+        raise ValueError("time_budget_sec는 1 이상의 정수여야 합니다.") from exc
+
+    return build_scenario_payload(
+        current=current,
+        test_name=test_name,
+        url=url,
+        goal=goal,
+        time_budget_sec=time_budget_sec,
+        existing_ids=set(existing_ids or set()),
+    )
+
+
+def open_scenario_form_pyside(
+    *,
+    emit: OutputFn,
+    existing: Mapping[str, Any] | None = None,
+    existing_ids: set[str] | None = None,
+    default_url: str = "",
+    title: str = "새 테스트 추가",
+) -> dict[str, Any] | None:
+    del emit
+    request_payload = {
+        "existing": dict(existing or {}),
+        "existing_ids": sorted({str(item).strip() for item in (existing_ids or set()) if str(item).strip()}),
+        "default_url": str(default_url or ""),
+        "title": str(title or "새 테스트 추가"),
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as handle:
+        request_path = Path(handle.name)
+        handle.write(json.dumps(request_payload, ensure_ascii=False))
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "gaia.src.terminal_benchmark_mode",
+                "--scenario-form-worker",
+                str(request_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    finally:
+        try:
+            request_path.unlink()
+        except Exception:
+            pass
+    if proc.returncode == 0:
+        stdout = str(proc.stdout or "").strip()
+        if not stdout:
+            return None
+        parsed = json.loads(stdout)
+        if not isinstance(parsed, Mapping):
+            raise RuntimeError("PySide6 입력창 결과가 올바른 JSON 객체가 아닙니다.")
+        return dict(parsed)
+    if proc.returncode == 2:
+        return None
+    raise RuntimeError((proc.stderr or proc.stdout or "PySide6 입력창 실행 실패").strip())
+
+
+def open_scenario_form_gui(
+    *,
+    emit: OutputFn,
+    existing: Mapping[str, Any] | None = None,
+    existing_ids: set[str] | None = None,
+    default_url: str = "",
+    title: str = "새 테스트 추가",
+) -> dict[str, Any] | None:
+    current = dict(existing or {})
+
+    try:
+        return open_scenario_form_pyside(
+            emit=emit,
+            existing=current,
+            existing_ids=set(existing_ids or set()),
+            default_url=default_url,
+            title=title,
+        )
+    except Exception as pyside_exc:
+        emit(f"PySide6 GUI를 사용할 수 없어 대체 입력창으로 전환합니다: {pyside_exc}")
+
+    if sys.platform == "darwin":
+        try:
+            return open_scenario_form_macos_dialogs(
+                emit=emit,
+                existing=current,
+                existing_ids=set(existing_ids or set()),
+                default_url=default_url,
+                title=title,
+            )
+        except Exception as fallback_exc:
+            emit(f"macOS 입력창도 열지 못해 터미널 입력으로 전환합니다: {fallback_exc}")
+            return None
+    if sys.platform.startswith("win"):
+        try:
+            return open_scenario_form_windows_dialogs(
+                emit=emit,
+                existing=current,
+                existing_ids=set(existing_ids or set()),
+                default_url=default_url,
+                title=title,
+            )
+        except Exception as fallback_exc:
+            emit(f"Windows 입력창도 열지 못해 터미널 입력으로 전환합니다: {fallback_exc}")
+            return None
+    emit("GUI 입력창을 열지 못해 터미널 입력으로 전환합니다.")
+    return None
+
+
+def write_benchmark_report_html(
+    *,
+    workspace_root: Path,
+    preset: BenchmarkPreset,
+    selected_url: str,
+) -> Path:
+    reports = _scan_benchmark_reports_for_preset(
+        workspace_root=workspace_root,
+        preset=preset,
+        selected_url=selected_url,
+    )
+    html_doc = render_benchmark_reports_html(
+        site_label=preset.label,
+        selected_url=selected_url,
+        reports=reports,
+    )
+    out_dir = workspace_root / "artifacts" / "tmp" / "benchmark_reports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / f"{preset.key}_benchmark_report.html"
+    report_path.write_text(html_doc, encoding="utf-8")
+    return report_path
+
+
+def _summary_matches_preset(summary: Mapping[str, Any], preset: BenchmarkPreset, selected_url: str) -> bool:
+    site = summary.get("site") if isinstance(summary.get("site"), Mapping) else {}
+    base_url = str(site.get("base_url") or "").strip()
+    host = extract_url_host(base_url)
+    selected_host = extract_url_host(selected_url)
+    if selected_host and host == selected_host:
+        return True
+    if host and any(alias in host for alias in preset.host_aliases):
+        return True
+    return False
+
+
+def _scan_benchmark_reports_for_preset(
+    *,
+    workspace_root: Path,
+    preset: BenchmarkPreset,
+    selected_url: str,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    if find_preset(preset.key) is not None:
+        return scan_benchmark_reports(
+            workspace_root=workspace_root,
+            site_key=preset.key,
+            selected_url=selected_url,
+            limit=limit,
+        )
+    root = workspace_root / "artifacts" / "benchmarks"
+    if not root.exists():
+        return []
+    reports: list[dict[str, Any]] = []
+    for summary_path in sorted(root.glob("*/summary.json"), reverse=True):
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(summary, Mapping):
+            continue
+        if not _summary_matches_preset(summary, preset, selected_url):
+            continue
+        result_path = summary_path.with_name("results.json")
+        results: list[dict[str, Any]] = []
+        if result_path.exists():
+            try:
+                parsed = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, list):
+                    results = [row for row in parsed if isinstance(row, dict)]
+            except Exception:
+                results = []
+        reports.append(
+            {
+                "artifact_dir": str(summary_path.parent),
+                "summary_path": str(summary_path),
+                "results_path": str(result_path),
+                "summary": dict(summary),
+                "results": results,
+            }
+        )
+        if len(reports) >= max(1, int(limit)):
+            break
+    return reports
+
+
+def open_benchmark_report(report_path: Path, opener: ReportOpener = webbrowser.open_new_tab) -> bool:
+    return bool(opener(report_path.resolve().as_uri()))
+
+
+def _normalize_battle_site_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if not re.match(r"^https?://", raw):
+        raw = f"https://{raw}"
+    parsed = urllib.parse.urlparse(raw)
+    if not parsed.netloc:
+        return ""
+    if parsed.path.rstrip("/").endswith("/api/records"):
+        raw = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+    return raw.rstrip("/")
+
+
+def _battle_site_url_from_env(env: Mapping[str, str]) -> str:
+    direct = _normalize_battle_site_url(str(env.get("GAIA_BATTLE_SITE_URL") or ""))
+    if direct:
+        return direct
+    return _normalize_battle_site_url(str(env.get("GAIA_BATTLE_UPLOAD_URL") or ""))
+
+
+def _battle_scenario_label(scenario: Mapping[str, Any] | None, *, fallback: str = "현장 QA 미션") -> str:
+    current = scenario if isinstance(scenario, Mapping) else {}
+    for key in ("scenario_label", "name", "title", "description", "goal"):
+        text = str(current.get(key) or "").strip()
+        if text:
+            return text[:180]
+    scenario_id = str(current.get("id") or "").strip()
+    return scenario_id or fallback
+
+
+def _first_scenario(suite_payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    for raw in list(suite_payload.get("scenarios") or []):
+        if isinstance(raw, Mapping):
+            return dict(raw)
+    return None
+
+
+def _battle_web_config_from_prompt(
+    *,
+    prompt: PromptTextFn,
+    emit: OutputFn,
+    env: Mapping[str, str] | None = None,
+) -> BattleWebConfig | None:
+    current_env = env or os.environ
+    site_default = _battle_site_url_from_env(current_env)
+    site_url = _normalize_battle_site_url(
+        prompt("Human vs GAIA Vercel 사이트 URL (빈칸: 웹 연동 안 함)", default=site_default or "")
+    )
+    if not site_url:
+        emit("Human vs GAIA 웹 연동을 건너뜁니다. 로컬 artifact만 남깁니다.")
+        return None
+
+    session_default = str(current_env.get("GAIA_BATTLE_SESSION_ID") or "").strip() or BATTLE_DEFAULT_SESSION_ID
+    session_id = str(prompt("대결 세션 이름", default=session_default)).strip() or session_default
+    token = str(
+        prompt(
+            "GAIA 업로드 토큰 (Vercel BATTLE_UPLOAD_TOKEN과 같게, 없으면 빈칸)",
+            default=str(current_env.get("GAIA_BATTLE_UPLOAD_TOKEN") or ""),
+        )
+    ).strip()
+    config = BattleWebConfig(
+        site_url=site_url,
+        upload_url=f"{site_url}/api/records",
+        session_id=session_id,
+        upload_token=token,
+    )
+    _emit_battle_web_config(config, emit)
+    return config
+
+
+def _hardcoded_battle_web_config(env: Mapping[str, str] | None = None) -> BattleWebConfig:
+    current_env = env or os.environ
+    site_url = _normalize_battle_site_url(BATTLE_DEFAULT_SITE_URL)
+    token = str(current_env.get("GAIA_BATTLE_UPLOAD_TOKEN") or "").strip()
+    return BattleWebConfig(
+        site_url=site_url,
+        upload_url=f"{site_url}/api/records",
+        session_id=BATTLE_DEFAULT_SESSION_ID,
+        upload_token=token,
+    )
+
+
+def _wants_battle_web_connection(answer: str) -> bool:
+    normalized = str(answer or "").strip().lower()
+    if not normalized:
+        return True
+    return normalized not in {"n", "no", "nope", "false", "0", "ㄴ", "아니오", "아니요", "아니", "안함"}
+
+
+def _battle_web_config_from_confirmation(
+    *,
+    prompt: PromptTextFn,
+    emit: OutputFn,
+    env: Mapping[str, str] | None = None,
+) -> BattleWebConfig | None:
+    answer = prompt(
+        "Human vs GAIA 웹 보드에 연결할까요? (Y/n)",
+        default="Y",
+    )
+    if not _wants_battle_web_connection(answer):
+        emit("Human vs GAIA 웹 보드 연결을 건너뜁니다. 로컬 artifact만 남깁니다.")
+        return None
+    config = _hardcoded_battle_web_config(env=env)
+    _emit_battle_web_config(config, emit)
+    return config
+
+
+def _emit_battle_web_config(config: BattleWebConfig, emit: OutputFn) -> None:
+    emit(f"Human vs GAIA 웹 보드: {config.site_url}/battle/{config.session_id}")
+    emit(f"Human 입력 화면: {config.site_url}/battle/{config.session_id}/human")
+
+
+def _post_battle_session_start(
+    *,
+    config: BattleWebConfig,
+    scenario: Mapping[str, Any] | None,
+    emit: OutputFn,
+) -> tuple[str, bool, str]:
+    scenario_id = str((scenario or {}).get("id") or "live-mission").strip() or "live-mission"
+    scenario_label = _battle_scenario_label(scenario)
+    started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    battle_run_id = _battle_run_id_slug(started_at)
+    body = json.dumps(
+        {
+            "sessionId": config.session_id,
+            "scenarioId": scenario_id,
+            "scenarioLabel": scenario_label,
+            "humanStartedAt": started_at,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{config.site_url}/api/session",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            ok = 200 <= int(response.status) < 300
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        emit(f"Human vs GAIA 웹 타이머 시작 실패: {exc}")
+        return scenario_label, False, battle_run_id
+    if ok:
+        emit(f"Human 타이머 시작: {scenario_label}")
+    else:
+        emit("Human vs GAIA 웹 타이머 시작 응답이 성공 범위가 아닙니다.")
+    return scenario_label, ok, battle_run_id
+
+
+def _battle_run_id_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9가-힣_-]+", "-", str(value or "").strip().lower()).strip("-")
+
+
+def run_benchmark_suite(
+    *,
+    workspace_root: Path,
+    preset: BenchmarkPreset,
+    target_url: str,
+    suite_payload: Mapping[str, Any],
+    emit: OutputFn,
+    run_tag: str,
+    timeout_cap: int = 600,
+    process_factory: ProcessFactory = subprocess.Popen,
+    push_metrics: bool = False,
+    runner_id: str = "",
+    qa_mode: str | None = None,
+    battle_board: bool = False,
+    battle_upload_url: str = "",
+    battle_session_id: str = "",
+    battle_upload_token: str = "",
+    battle_scenario_label: str = "",
+    battle_run_id: str = "",
+) -> dict[str, Any]:
+    scenarios = [dict(row) for row in list(suite_payload.get("scenarios") or []) if isinstance(row, Mapping)]
+    if not scenarios:
+        emit("등록된 테스트가 없습니다. 먼저 테스트를 추가해주세요.")
+        return {"status": "empty", "summary": {}, "results": [], "output_dir": ""}
+
+    normalized_qa_mode = normalize_benchmark_qa_mode(qa_mode)
+    overridden = override_suite_urls(suite_payload, target_url)
+    started = int(time.time())
+    tmp_root = workspace_root / "artifacts" / "tmp" / "terminal_benchmark_mode"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    suite_slug = _slugify(benchmark_qa_mode_run_tag(normalized_qa_mode, run_tag))
+    tmp_suite_path = tmp_root / f"{preset.key}_{suite_slug}_{started}.json"
+    tmp_suite_path.write_text(json.dumps(overridden, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    output_dir = (workspace_root / "artifacts" / "benchmarks" / f"{preset.key}_{suite_slug}_{started}").resolve()
+    cmd = [
+        sys.executable,
+        "scripts/run_goal_benchmark.py",
+        "--suite",
+        str(tmp_suite_path),
+        "--repeats",
+        "1",
+        "--timeout-cap",
+        str(max(600, int(timeout_cap))),
+        "--session-prefix",
+        f"terminal-{preset.key}",
+        "--output-dir",
+        str(output_dir),
+    ]
+    if normalized_qa_mode:
+        cmd.extend(["--qa-mode", normalized_qa_mode])
+    if push_metrics:
+        cmd.append("--push-metrics")
+    if battle_board:
+        cmd.append("--battle-board")
+    if battle_upload_url and battle_session_id:
+        cmd.extend(["--battle-upload-url", battle_upload_url])
+        cmd.extend(["--battle-session-id", battle_session_id])
+        if battle_upload_token:
+            cmd.extend(["--battle-upload-token", battle_upload_token])
+    env = os.environ.copy()
+    resolved_runner_id = resolve_runner_id(runner_id, env)
+    env["GAIA_RUNNER_ID"] = resolved_runner_id
+    cmd.extend(["--runner-id", resolved_runner_id])
+    env.setdefault("GAIA_RAIL_ENABLED", "0")
+    env.setdefault("GAIA_LLM_MODEL", env.get("GAIA_LLM_MODEL", "gpt-5.5"))
+    if battle_scenario_label:
+        env["GAIA_BATTLE_SCENARIO_LABEL"] = battle_scenario_label
+    if battle_run_id:
+        env["GAIA_BATTLE_RUN_ID"] = battle_run_id
+    if os.name == "nt":
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    emit(f"{preset.label} 벤치를 실행합니다.")
+    emit(f"   - target: {target_url}")
+    emit(f"   - suite: {tmp_suite_path}")
+    emit(f"   - runner_id: {resolved_runner_id}")
+    emit(f"   - qa_mode: {benchmark_qa_mode_label(normalized_qa_mode)}")
+    if push_metrics:
+        emit("   - metrics: upload enabled (--push-metrics)")
+    if battle_board:
+        emit("   - battle_board: enabled")
+    if battle_upload_url and battle_session_id:
+        emit(f"   - battle_web: {battle_session_id}")
+
+    process = process_factory(
+        cmd,
+        cwd=str(workspace_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+    )
+    captured: list[str] = []
+    if process.stdout is not None:
+        for raw_line in process.stdout:
+            line = str(raw_line or "").rstrip()
+            if not line:
+                continue
+            captured.append(line)
+            emit(line)
+    return_code = process.wait()
+
+    summary_path = output_dir / "summary.json"
+    results_path = output_dir / "results.json"
+    summary_payload = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    results_payload = json.loads(results_path.read_text(encoding="utf-8")) if results_path.exists() else []
+    status_counts = summary_payload.get("status_counts") if isinstance(summary_payload, Mapping) else {}
+    status_counts = status_counts if isinstance(status_counts, Mapping) else {}
+    emit(
+        "벤치 실행 완료"
+        f" | success={int(status_counts.get('SUCCESS') or 0)}"
+        f" fail={int(status_counts.get('FAIL') or 0)}"
+        f" | artifact={output_dir}"
+    )
+    return {
+        "status": "success" if return_code == 0 else "failed",
+        "summary": summary_payload,
+        "results": results_payload,
+        "output_dir": str(output_dir),
+        "cmd": cmd,
+        "captured": captured,
+        "qa_mode": normalized_qa_mode or "off",
+        "battle_board": summary_payload.get("battle_board") if isinstance(summary_payload, Mapping) else {},
+    }
+
+
+def run_external_public_benchmark_pack(
+    *,
+    workspace_root: Path,
+    emit: OutputFn,
+    manifest_path: Path | str = EXTERNAL_PUBLIC_MANIFEST_PATH,
+    repeats: int = 1,
+    timeout_cap: int = 600,
+    session_prefix: str = "terminal-external-public",
+    push_metrics: bool = True,
+    runner_id: str = "",
+    process_factory: ProcessFactory = subprocess.Popen,
+    qa_mode: str | None = None,
+) -> dict[str, Any]:
+    resolved_manifest = (workspace_root / manifest_path).resolve()
+    if not resolved_manifest.exists():
+        emit(f"전체 benchmark manifest를 찾지 못했습니다: {resolved_manifest}")
+        return {"status": "missing_manifest", "summary": {}, "results": [], "output_dir": ""}
+
+    normalized_qa_mode = normalize_benchmark_qa_mode(qa_mode)
+    env = os.environ.copy()
+    resolved_runner_id = resolve_runner_id(runner_id, env)
+    env["GAIA_RUNNER_ID"] = resolved_runner_id
+    env.setdefault("GAIA_OPENCLAW_HEADLESS", "1")
+    env.setdefault("GAIA_RAIL_ENABLED", "0")
+    env.setdefault("GAIA_LLM_MODEL", env.get("GAIA_LLM_MODEL", "gpt-5.5"))
+    if os.name == "nt":
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    cmd = [
+        sys.executable,
+        "scripts/run_kpi_benchmark_pack.py",
+        "--suite-manifest",
+        str(resolved_manifest),
+        "--repeats",
+        str(max(1, int(repeats))),
+        "--timeout-cap",
+        str(max(600, int(timeout_cap))),
+        "--session-prefix",
+        str(session_prefix),
+        "--runner-id",
+        resolved_runner_id,
+    ]
+    if normalized_qa_mode:
+        cmd.extend(["--qa-mode", normalized_qa_mode])
+    if push_metrics:
+        cmd.append("--push-metrics")
+
+    emit("전체사이트 전체케이스 benchmark를 실행합니다.")
+    emit(f"   - manifest: {resolved_manifest}")
+    emit(f"   - runner_id: {resolved_runner_id}")
+    emit("   - headless: enabled")
+    emit(f"   - qa_mode: {benchmark_qa_mode_label(normalized_qa_mode)}")
+    if push_metrics:
+        emit("   - metrics: upload enabled (--push-metrics)")
+
+    process = process_factory(
+        cmd,
+        cwd=str(workspace_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+    )
+    captured: list[str] = []
+    if process.stdout is not None:
+        for raw_line in process.stdout:
+            line = str(raw_line or "").rstrip()
+            if not line:
+                continue
+            captured.append(line)
+            emit(line)
+    return_code = process.wait()
+
+    payload: dict[str, Any] = {}
+    for line in reversed(captured):
+        text = line.strip()
+        if not text.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            payload = parsed
+            break
+
+    output_dir = str(payload.get("artifact_dir") or "")
+    emit(
+        "전체 benchmark 실행 완료"
+        f" | status={'success' if return_code == 0 else 'failed'}"
+        + (f" | artifact={output_dir}" if output_dir else "")
+    )
+    return {
+        "status": "success" if return_code == 0 else "failed",
+        "summary": payload.get("overall_kpis") if isinstance(payload.get("overall_kpis"), Mapping) else {},
+        "results": [],
+        "output_dir": output_dir,
+        "cmd": cmd,
+        "captured": captured,
+        "qa_mode": normalized_qa_mode or "off",
+    }
+
+
+def manage_benchmark_sites(
+    *,
+    workspace_root: Path,
+    registry: Mapping[str, Any],
+    action: str,
+    prompt_select: PromptSelectFn,
+    prompt: PromptTextFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+) -> dict[str, Any]:
+    normalized = dict(registry)
+    catalog, preset_map = build_terminal_benchmark_catalog(normalized)
+    custom_entries = [item for item in catalog if bool(item.get("is_custom"))]
+
+    if action == SITE_ADD_OPTION:
+        existing_keys = {str(item.get("key") or "").strip() for item in catalog}
+        existing_labels = {str(item.get("label") or "").strip() for item in catalog}
+        label = str(prompt_non_empty("추가할 사이트 이름", default=None)).strip()
+        if label in existing_labels:
+            emit(f"이미 존재하는 사이트 이름입니다: {label}")
+            return normalized
+        generated_key = _slugify(label).replace("-", "_")
+        site_key = str(prompt("site_key (옵션)", default=generated_key or "custom_site")).strip() or generated_key or "custom_site"
+        site_key = _slugify(site_key).replace("-", "_")
+        while not site_key or site_key in existing_keys:
+            if site_key in existing_keys:
+                emit(f"이미 존재하는 site_key입니다: {site_key}")
+            site_key = _slugify(str(prompt_non_empty("중복되지 않는 site_key", default=None)).strip()).replace("-", "_")
+        default_url = str(prompt_non_empty("기본 링크", default=None)).strip()
+        site_definition = create_custom_site_definition(site_key=site_key, label=label, default_url=default_url)
+        suite_path = (workspace_root / str(site_definition["suite_path"])).resolve()
+        save_suite_payload(
+            suite_path,
+            create_custom_suite_payload(site_key=site_key, label=label, default_url=default_url),
+        )
+        normalized = upsert_custom_benchmark_site(normalized, site_key=site_key, site_definition=site_definition)
+        emit(f"🆕 사이트 추가 완료: {label} ({site_key})")
+        return normalized
+
+    if not custom_entries:
+        emit("편집/삭제 가능한 커스텀 사이트가 아직 없습니다.")
+        return normalized
+
+    custom_labels = tuple(item["label"] for item in custom_entries) + ("이전으로",)
+    selected_label = prompt_select(
+        "커스텀 벤치 사이트를 선택하세요",
+        custom_labels,
+        default=custom_entries[0]["label"],
+    )
+    if selected_label == "이전으로":
+        return normalized
+    site_entry = next((item for item in custom_entries if item["label"] == selected_label), None)
+    if site_entry is None:
+        emit("선택한 커스텀 사이트를 찾지 못했습니다.")
+        return normalized
+    preset = preset_map.get(str(site_entry.get("key") or "").strip())
+    if preset is None:
+        emit("선택한 사이트 preset을 찾지 못했습니다.")
+        return normalized
+
+    if action == SITE_EDIT_OPTION:
+        updated_label = str(prompt("사이트 이름", default=preset.label)).strip() or preset.label
+        occupied_labels = {
+            str(item.get("label") or "").strip()
+            for item in catalog
+            if str(item.get("key") or "").strip() != preset.key
+        }
+        if updated_label in occupied_labels:
+            emit(f"이미 존재하는 사이트 이름입니다: {updated_label}")
+            return normalized
+        updated_url = str(prompt_non_empty("기본 링크", default=preset.default_url)).strip()
+        updated_definition = create_custom_site_definition(
+            site_key=preset.key,
+            label=updated_label,
+            default_url=updated_url,
+        )
+        suite_path = (workspace_root / str(updated_definition["suite_path"])).resolve()
+        suite_payload = load_suite_payload(workspace_root, str(updated_definition["suite_path"]))
+        suite_payload["site"] = {
+            **dict(suite_payload.get("site") or {}),
+            "name": updated_label,
+            "base_url": updated_url,
+        }
+        save_suite_payload(suite_path, suite_payload)
+        normalized = upsert_custom_benchmark_site(
+            normalized,
+            site_key=preset.key,
+            site_definition=updated_definition,
+        )
+        emit(f"✏️ 사이트 수정 완료: {updated_label} ({preset.key})")
+        return normalized
+
+    suite_path = (workspace_root / str(preset.suite_path or "")).resolve()
+    if suite_path.exists():
+        suite_path.unlink()
+    normalized = delete_custom_benchmark_site(normalized, preset.key)
+    emit(f"🗑️ 사이트 삭제 완료: {preset.label} ({preset.key})")
+    return normalized
+
+
+def run_terminal_benchmark_mode(
+    *,
+    workspace_root: Path,
+    prompt_select: PromptSelectFn,
+    prompt: PromptTextFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn = print,
+    registry_path: Path | None = None,
+    run_suite_handler: Callable[..., dict[str, Any]] = run_benchmark_suite,
+    run_pack_handler: Callable[..., dict[str, Any]] = run_external_public_benchmark_pack,
+    report_writer: Callable[..., Path] = write_benchmark_report_html,
+    report_opener: Callable[[Path], bool] = open_benchmark_report,
+    grafana_opener: GrafanaOpener = webbrowser.open_new_tab,
+    record_pruner: RecordPruner = prune_benchmark_reports,
+    scenario_form_opener: ScenarioFormOpener = open_scenario_form_gui,
+    push_metrics: bool = False,
+    monitoring_config_path: Path | None = None,
+    auto_pull_shared_tests: bool = True,
+    qa_mode: str | None = None,
+    dedicated_deep_qa: bool = False,
+    battle_board: bool = False,
+    battle_web_config: BattleWebConfig | None = None,
+    deep_qa_manifest_path: Path | str = DEEP_QA_BENCHMARK_MANIFEST_PATH,
+    site_prompt_title: str = "벤치 사이트를 선택하세요",
+    site_action_options: Sequence[str] | None = None,
+    allow_site_management: bool = True,
+    allow_all_sites_option: bool = True,
+    site_exit_option: str = SITE_EXIT_OPTION,
+    site_exit_result: int = 0,
+    site_leading_options: Sequence[str] | None = None,
+    site_special_action_handlers: Mapping[str, Callable[[], None]] | None = None,
+    scenario_filter_map: Mapping[str, set[str]] | None = None,
+    catalog_override: CatalogOverride | None = None,
+) -> int:
+    registry = load_benchmark_registry(registry_path)
+    auto_pull_attempted: set[str] = set()
+    runner_id = resolve_runner_id(env=os.environ)
+    normalized_qa_mode = DEEP_ADAPTIVE_QA_MODE if dedicated_deep_qa else normalize_benchmark_qa_mode(qa_mode)
+    all_cases_option = DEEP_QA_ALL_CASES_OPTION if dedicated_deep_qa else ALL_SITES_ALL_CASES_OPTION
+    if normalized_qa_mode:
+        emit(f"Deep QA 벤치마크 프로필: {benchmark_qa_mode_label(normalized_qa_mode)} 모드로 실행합니다.")
+    if dedicated_deep_qa:
+        emit("Deep QA 전용 벤치마크: 기존 benchmark catalog/external public 150개와 분리된 suite만 사용합니다.")
+    action_options = tuple(
+        site_action_options
+        or ("새로운 테스트 추가", "기존 테스트 실행", "테스트 편집", SHARE_TESTS_OPTION, "지표 확인", "이전으로")
+    )
+
+    while True:
+        if dedicated_deep_qa:
+            catalog, preset_map = build_deep_qa_benchmark_catalog(
+                workspace_root=workspace_root,
+                manifest_path=deep_qa_manifest_path,
+            )
+            effective_all_cases_option = all_cases_option
+            effective_allow_all_sites_option = True
+            effective_allow_site_management = False
+            effective_site_exit_option = SITE_EXIT_OPTION
+        elif catalog_override is None:
+            catalog, preset_map = build_terminal_benchmark_catalog(registry)
+        elif callable(catalog_override):
+            catalog, preset_map = catalog_override(registry)
+        else:
+            catalog, preset_map = catalog_override
+        if not dedicated_deep_qa:
+            effective_all_cases_option = ALL_SITES_ALL_CASES_OPTION
+            effective_allow_all_sites_option = allow_all_sites_option
+            effective_allow_site_management = allow_site_management
+            effective_site_exit_option = site_exit_option
+        site_labels = tuple(item["label"] for item in catalog)
+        tail_options: list[str] = []
+        if effective_allow_site_management:
+            tail_options.extend((SITE_ADD_OPTION, SITE_EDIT_OPTION, SITE_DELETE_OPTION))
+        tail_options.append(effective_site_exit_option)
+        site_options = (
+            tuple(site_leading_options or ())
+            +
+            ((effective_all_cases_option,) if effective_allow_all_sites_option else tuple())
+            + site_labels
+            + tuple(tail_options)
+        )
+        default_site_option = (
+            effective_all_cases_option
+            if effective_allow_all_sites_option
+            else (
+                (tuple(site_leading_options or ())[0] if site_leading_options else None)
+                or (site_labels[0] if site_labels else effective_site_exit_option)
+            )
+        )
+        selected_site = prompt_select(
+            site_prompt_title,
+            site_options,
+            default=default_site_option,
+        )
+        if effective_allow_all_sites_option and selected_site == effective_all_cases_option:
+            _handle_all_sites_all_cases_run(
+                workspace_root=workspace_root,
+                prompt_select=prompt_select,
+                prompt_non_empty=prompt_non_empty,
+                emit=emit,
+                run_pack_handler=run_pack_handler,
+                monitoring_config_path=monitoring_config_path,
+                runner_id=runner_id,
+                qa_mode=normalized_qa_mode,
+                manifest_path=deep_qa_manifest_path if dedicated_deep_qa else EXTERNAL_PUBLIC_MANIFEST_PATH,
+                session_prefix="terminal-deep-qa" if dedicated_deep_qa else "terminal-external-public",
+            )
+            continue
+        if site_special_action_handlers and selected_site in site_special_action_handlers:
+            site_special_action_handlers[selected_site]()
+            continue
+        if selected_site == effective_site_exit_option:
+            if effective_site_exit_option == SITE_EXIT_OPTION:
+                emit("벤치마킹 모드를 종료합니다.")
+            else:
+                emit("이전 단계로 돌아갑니다.")
+            return int(site_exit_result)
+        if effective_allow_site_management and selected_site in {SITE_ADD_OPTION, SITE_EDIT_OPTION, SITE_DELETE_OPTION}:
+            registry = manage_benchmark_sites(
+                workspace_root=workspace_root,
+                registry=registry,
+                action=selected_site,
+                prompt_select=prompt_select,
+                prompt=prompt,
+                prompt_non_empty=prompt_non_empty,
+                emit=emit,
+            )
+            save_benchmark_registry(registry, registry_path)
+            continue
+
+        site_entry = next((item for item in catalog if item["label"] == selected_site), None)
+        if site_entry is None:
+            emit("선택한 사이트를 찾지 못했습니다.")
+            continue
+        preset = preset_map.get(str(site_entry.get("key") or "").strip())
+        if preset is None:
+            emit("선택한 사이트 preset을 찾지 못했습니다.")
+            continue
+
+        if dedicated_deep_qa:
+            selected_url = str(preset.default_url or site_entry.get("default_url") or "").strip()
+            if not selected_url:
+                emit("Deep QA suite의 base_url이 비어 있어 실행할 수 없습니다.")
+                continue
+        else:
+            selected_url, registry = _select_benchmark_url(
+                registry=registry,
+                site_entry=site_entry,
+                preset=preset,
+                prompt_select=prompt_select,
+                prompt_non_empty=prompt_non_empty,
+            )
+            if not selected_url:
+                continue
+            save_benchmark_registry(registry, registry_path)
+        if not dedicated_deep_qa and auto_pull_shared_tests and preset.key not in auto_pull_attempted:
+            auto_pull_attempted.add(preset.key)
+            _try_auto_pull_shared_suite(
+                workspace_root=workspace_root,
+                preset=preset,
+                selected_url=selected_url,
+                site_entry=site_entry,
+                emit=emit,
+                monitoring_config_path=monitoring_config_path,
+            )
+
+        while True:
+            action = prompt_select(
+                f"{preset.label} 작업을 선택하세요",
+                action_options,
+                default="기존 테스트 실행",
+            )
+            if action == "이전으로":
+                break
+
+            if action == "지표 확인":
+                _handle_metrics_view(
+                    workspace_root=workspace_root,
+                    preset=preset,
+                    selected_url=selected_url,
+                    prompt_select=prompt_select,
+                    prompt_non_empty=prompt_non_empty,
+                    emit=emit,
+                    report_writer=report_writer,
+                    report_opener=report_opener,
+                    grafana_opener=grafana_opener,
+                    record_pruner=record_pruner,
+                    monitoring_config_path=monitoring_config_path,
+                )
+                continue
+
+            suite_path = (workspace_root / str(preset.suite_path or "")).resolve()
+            suite_payload = _load_terminal_suite_payload(
+                workspace_root=workspace_root,
+                preset=preset,
+                selected_url=selected_url,
+                site_entry=site_entry,
+                emit=emit,
+            )
+            if suite_payload is None:
+                continue
+            suite_payload = _filter_suite_payload_for_allowed_scenarios(
+                suite_payload,
+                scenario_filter_map.get(preset.key) if scenario_filter_map else None,
+            )
+
+            if action == SHARE_TESTS_OPTION:
+                _handle_team_suite_sharing(
+                    workspace_root=workspace_root,
+                    preset=preset,
+                    suite_path=suite_path,
+                    suite_payload=suite_payload,
+                    prompt_select=prompt_select,
+                    prompt_non_empty=prompt_non_empty,
+                    emit=emit,
+                    monitoring_config_path=monitoring_config_path,
+                )
+                continue
+
+            if action == "새로운 테스트 추가":
+                existing_ids = {
+                    str(row.get("id") or "").strip()
+                    for row in list(suite_payload.get("scenarios") or [])
+                    if isinstance(row, Mapping)
+                }
+                new_scenario = scenario_form_opener(
+                    emit=emit,
+                    existing=None,
+                    existing_ids=existing_ids,
+                    default_url=selected_url,
+                    title=f"{preset.label} 테스트 추가",
+                )
+                if new_scenario is None:
+                    new_scenario = prompt_scenario_fields(
+                        prompt_select=prompt_select,
+                        prompt=prompt,
+                        prompt_non_empty=prompt_non_empty,
+                        emit=emit,
+                        existing=None,
+                        existing_ids=existing_ids,
+                        default_url=selected_url,
+                    )
+                updated_payload = append_scenario_to_suite(suite_payload, new_scenario)
+                save_suite_payload(suite_path, updated_payload)
+                emit(f"💾 테스트 추가 완료: {new_scenario['id']}")
+                continue
+
+            if action == "기존 테스트 실행":
+                if not _suite_has_scenarios(suite_payload):
+                    emit("등록된 테스트가 없습니다. 먼저 '새로운 테스트 추가'로 테스트를 추가해주세요.")
+                    continue
+                run_mode = prompt_select(
+                    "실행 범위를 선택하세요",
+                    ("기존 테스트 전체 실행", "개별 실행", "이전으로"),
+                    default="기존 테스트 전체 실행",
+                )
+                if run_mode == "이전으로":
+                    continue
+                if run_mode == "기존 테스트 전체 실행":
+                    push_metrics_for_run = _resolve_push_metrics_for_run(
+                        push_metrics=push_metrics,
+                        prompt_select=prompt_select,
+                    prompt_non_empty=prompt_non_empty,
+                    emit=emit,
+                    workspace_root=workspace_root,
+                    monitoring_config_path=monitoring_config_path,
+                    )
+                    first_scenario = _first_scenario(suite_payload)
+                    battle_scenario_label = ""
+                    battle_run_id = ""
+                    if battle_web_config is not None:
+                        battle_scenario_label, _, battle_run_id = _post_battle_session_start(
+                            config=battle_web_config,
+                            scenario=first_scenario,
+                            emit=emit,
+                        )
+                    run_suite_handler(
+                        workspace_root=workspace_root,
+                        preset=preset,
+                        target_url=selected_url,
+                        suite_payload=suite_payload,
+                        emit=emit,
+                        run_tag="full_suite",
+                        push_metrics=push_metrics_for_run,
+                        runner_id=runner_id,
+                        qa_mode=normalized_qa_mode,
+                        battle_board=battle_board,
+                        battle_upload_url=battle_web_config.upload_url if battle_web_config is not None else "",
+                        battle_session_id=battle_web_config.session_id if battle_web_config is not None else "",
+                        battle_upload_token=battle_web_config.upload_token if battle_web_config is not None else "",
+                        battle_scenario_label=battle_scenario_label,
+                        battle_run_id=battle_run_id,
+                    )
+                    continue
+
+                scenario_id = _select_scenario_id(
+                    suite_payload=suite_payload,
+                    prompt_select=prompt_select,
+                    emit=emit,
+                )
+                if not scenario_id:
+                    continue
+                push_metrics_for_run = _resolve_push_metrics_for_run(
+                    push_metrics=push_metrics,
+                    prompt_select=prompt_select,
+                    prompt_non_empty=prompt_non_empty,
+                    emit=emit,
+                    workspace_root=workspace_root,
+                        monitoring_config_path=monitoring_config_path,
+                    )
+                single_payload = build_single_scenario_suite_payload(suite_payload, scenario_id)
+                selected_scenario = _find_scenario(single_payload, scenario_id) or _find_scenario(suite_payload, scenario_id)
+                battle_scenario_label = ""
+                battle_run_id = ""
+                if battle_web_config is not None:
+                    battle_scenario_label, _, battle_run_id = _post_battle_session_start(
+                        config=battle_web_config,
+                        scenario=selected_scenario,
+                        emit=emit,
+                    )
+                run_suite_handler(
+                    workspace_root=workspace_root,
+                    preset=preset,
+                    target_url=selected_url,
+                    suite_payload=single_payload,
+                    emit=emit,
+                    run_tag=scenario_id,
+                    push_metrics=push_metrics_for_run,
+                    runner_id=runner_id,
+                    qa_mode=normalized_qa_mode,
+                    battle_board=battle_board,
+                    battle_upload_url=battle_web_config.upload_url if battle_web_config is not None else "",
+                    battle_session_id=battle_web_config.session_id if battle_web_config is not None else "",
+                    battle_upload_token=battle_web_config.upload_token if battle_web_config is not None else "",
+                    battle_scenario_label=battle_scenario_label,
+                    battle_run_id=battle_run_id,
+                )
+                continue
+
+            if action == "테스트 편집":
+                scenario_id = _select_scenario_id(
+                    suite_payload=suite_payload,
+                    prompt_select=prompt_select,
+                    emit=emit,
+                )
+                if not scenario_id:
+                    continue
+                edit_action = prompt_select(
+                    "테스트 편집 작업을 선택하세요",
+                    ("수정", "삭제", "이전으로"),
+                    default="수정",
+                )
+                if edit_action == "이전으로":
+                    continue
+                existing = _find_scenario(suite_payload, scenario_id)
+                if existing is None:
+                    emit(f"선택한 테스트를 찾지 못했습니다: {scenario_id}")
+                    continue
+                if edit_action == "삭제":
+                    updated_payload = delete_scenario_from_suite(suite_payload, scenario_id)
+                    save_suite_payload(suite_path, updated_payload)
+                    emit(f"🗑️ 테스트 삭제 완료: {scenario_id}")
+                    continue
+
+                updated_scenario = prompt_scenario_fields(
+                    prompt_select=prompt_select,
+                    prompt=prompt,
+                    prompt_non_empty=prompt_non_empty,
+                    emit=emit,
+                    existing=existing,
+                    existing_ids={
+                        str(row.get("id") or "").strip()
+                        for row in list(suite_payload.get("scenarios") or [])
+                        if isinstance(row, Mapping)
+                    },
+                    default_url=selected_url,
+                )
+                updated_payload = replace_scenario_in_suite(suite_payload, scenario_id, updated_scenario)
+                save_suite_payload(suite_path, updated_payload)
+                emit(f"✏️ 테스트 수정 완료: {updated_scenario['id']}")
+                continue
+
+
+def _handle_all_sites_all_cases_run(
+    *,
+    workspace_root: Path,
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    run_pack_handler: Callable[..., dict[str, Any]],
+    monitoring_config_path: Path | None = None,
+    runner_id: str = "",
+    qa_mode: str | None = None,
+    manifest_path: Path | str = EXTERNAL_PUBLIC_MANIFEST_PATH,
+    session_prefix: str = "terminal-external-public",
+) -> None:
+    if not _ensure_monitoring_connection_required(
+        prompt_select=prompt_select,
+        prompt_non_empty=prompt_non_empty,
+        emit=emit,
+        workspace_root=workspace_root,
+        monitoring_config_path=monitoring_config_path,
+    ):
+        emit("전체사이트 전체케이스 실행을 취소했습니다. Grafana 연결 후 다시 실행해주세요.")
+        return
+
+    run_pack_handler(
+        workspace_root=workspace_root,
+        emit=emit,
+        manifest_path=manifest_path,
+        repeats=1,
+        timeout_cap=600,
+        session_prefix=session_prefix,
+        push_metrics=True,
+        runner_id=runner_id,
+        qa_mode=qa_mode,
+    )
+
+
+def run_terminal_human_vs_gaia_mode(
+    *,
+    workspace_root: Path,
+    prompt_select: PromptSelectFn,
+    prompt: PromptTextFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn = print,
+    registry_path: Path | None = None,
+    run_suite_handler: Callable[..., dict[str, Any]] = run_benchmark_suite,
+    report_writer: Callable[..., Path] = write_benchmark_report_html,
+    report_opener: Callable[[Path], bool] = open_benchmark_report,
+    grafana_opener: GrafanaOpener = webbrowser.open_new_tab,
+    record_pruner: RecordPruner = prune_benchmark_reports,
+    scenario_form_opener: ScenarioFormOpener = open_scenario_form_gui,
+    push_metrics: bool = False,
+    monitoring_config_path: Path | None = None,
+    auto_pull_shared_tests: bool = False,
+) -> int:
+    registry = load_benchmark_registry(registry_path)
+    battle_web_config = _battle_web_config_from_confirmation(
+        prompt=prompt,
+        emit=emit,
+        env=os.environ,
+    )
+
+    def _build_catalog(
+        current_registry: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, BenchmarkPreset], dict[str, set[str]]]:
+        return build_human_vs_gaia_catalog(
+            current_registry,
+            workspace_root=workspace_root,
+        )
+
+    def _build_catalog_override(
+        current_registry: Mapping[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, BenchmarkPreset]]:
+        current_catalog, current_preset_map, _ = _build_catalog(current_registry)
+        return current_catalog, current_preset_map
+
+    _, _, scenario_filter_map = _build_catalog(registry)
+
+    def _run_all_sites() -> None:
+        current_registry = load_benchmark_registry(registry_path)
+        current_catalog, current_preset_map, current_scenario_filter_map = _build_catalog(current_registry)
+        _run_human_vs_gaia_all_sites(
+            workspace_root=workspace_root,
+            catalog=current_catalog,
+            preset_map=current_preset_map,
+            scenario_filter_map=current_scenario_filter_map,
+            prompt_select=prompt_select,
+            prompt_non_empty=prompt_non_empty,
+            emit=emit,
+            run_suite_handler=run_suite_handler,
+            push_metrics=push_metrics,
+            monitoring_config_path=monitoring_config_path,
+            runner_id=resolve_runner_id(env=os.environ),
+            battle_board=True,
+            battle_web_config=battle_web_config,
+        )
+
+    site_special_action_handlers = {
+        HUMAN_VS_GAIA_RUN_ALL_OPTION: _run_all_sites
+    }
+    return run_terminal_benchmark_mode(
+        workspace_root=workspace_root,
+        prompt_select=prompt_select,
+        prompt=prompt,
+        prompt_non_empty=prompt_non_empty,
+        emit=emit,
+        registry_path=registry_path,
+        run_suite_handler=run_suite_handler,
+        report_writer=report_writer,
+        report_opener=report_opener,
+        grafana_opener=grafana_opener,
+        record_pruner=record_pruner,
+        scenario_form_opener=scenario_form_opener,
+        push_metrics=push_metrics,
+        monitoring_config_path=monitoring_config_path,
+        auto_pull_shared_tests=auto_pull_shared_tests,
+        battle_board=True,
+        battle_web_config=battle_web_config,
+        site_prompt_title="GAIA_VS_HUMAN 사이트를 선택하세요",
+        site_action_options=("기존 테스트 실행", "지표 확인", "이전으로"),
+        allow_site_management=False,
+        allow_all_sites_option=False,
+        site_exit_option="이전으로",
+        site_exit_result=130,
+        site_leading_options=(HUMAN_VS_GAIA_RUN_ALL_OPTION,),
+        site_special_action_handlers=site_special_action_handlers,
+        scenario_filter_map=scenario_filter_map,
+        catalog_override=_build_catalog_override,
+    )
+
+
+def _find_scenario(suite_payload: Mapping[str, Any], scenario_id: str) -> dict[str, Any] | None:
+    target_id = str(scenario_id or "").strip()
+    for raw in list(suite_payload.get("scenarios") or []):
+        if not isinstance(raw, Mapping):
+            continue
+        if str(raw.get("id") or "").strip() == target_id:
+            return dict(raw)
+    return None
+
+
+def _suite_has_scenarios(suite_payload: Mapping[str, Any]) -> bool:
+    return any(isinstance(row, Mapping) for row in list(suite_payload.get("scenarios") or []))
+
+
+def _run_human_vs_gaia_all_sites(
+    *,
+    workspace_root: Path,
+    catalog: Sequence[Mapping[str, Any]],
+    preset_map: Mapping[str, BenchmarkPreset],
+    scenario_filter_map: Mapping[str, set[str]],
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    run_suite_handler: Callable[..., dict[str, Any]],
+    push_metrics: bool,
+    monitoring_config_path: Path | None,
+    runner_id: str,
+    battle_board: bool = False,
+    battle_web_config: BattleWebConfig | None = None,
+) -> None:
+    runnable_entries: list[tuple[Mapping[str, Any], BenchmarkPreset]] = []
+    for site_entry in catalog:
+        site_key = str(site_entry.get("key") or "").strip()
+        if not site_key or site_key in HUMAN_VS_GAIA_SKIP_SITE_KEYS:
+            continue
+        preset = preset_map.get(site_key)
+        if preset is None:
+            continue
+        runnable_entries.append((site_entry, preset))
+
+    if not runnable_entries:
+        emit("실행할 수 있는 GAIA_VS_HUMAN 사이트가 없습니다.")
+        return
+
+    push_metrics_for_run = _resolve_push_metrics_for_run(
+        push_metrics=push_metrics,
+        prompt_select=prompt_select,
+        prompt_non_empty=prompt_non_empty,
+        emit=emit,
+        workspace_root=workspace_root,
+        monitoring_config_path=monitoring_config_path,
+    )
+
+    total = len(runnable_entries)
+    total_case_count = sum(
+        max(0, len(scenario_filter_map.get(str(preset.key or "").strip(), set())))
+        for _, preset in runnable_entries
+    )
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    completed_case_count = 0
+
+    emit(
+        "GAIA_VS_HUMAN 전체 사이트 전체 테스트를 시작합니다. "
+        f"(LMS 제외, 총 {total}개 사이트 / {total_case_count}개 케이스)"
+    )
+
+    for index, (site_entry, preset) in enumerate(runnable_entries, 1):
+        planned_site_case_count = max(
+            0,
+            len(scenario_filter_map.get(str(preset.key or "").strip(), set())),
+        )
+        selected_url = str(site_entry.get("default_url") or preset.default_url or "").strip()
+        if not selected_url:
+            skipped_count += 1
+            completed_case_count += planned_site_case_count
+            emit(f"[{index}/{total}] {preset.label} - URL이 없어 건너뜁니다.")
+            continue
+
+        suite_payload = _load_terminal_suite_payload(
+            workspace_root=workspace_root,
+            preset=preset,
+            selected_url=selected_url,
+            site_entry=site_entry,
+            emit=emit,
+        )
+        if suite_payload is None:
+            failed_count += 1
+            completed_case_count += planned_site_case_count
+            emit(f"[{index}/{total}] {preset.label} - suite 로드 실패")
+            continue
+
+        suite_payload = _filter_suite_payload_for_allowed_scenarios(
+            suite_payload,
+            scenario_filter_map.get(preset.key),
+        )
+        site_case_count = len(suite_payload.get("scenarios", []))
+        if not _suite_has_scenarios(suite_payload):
+            skipped_count += 1
+            completed_case_count += planned_site_case_count
+            emit(f"[{index}/{total}] {preset.label} - 실행 가능한 시나리오가 없어 건너뜁니다.")
+            continue
+
+        case_start = completed_case_count + 1
+        case_end = completed_case_count + site_case_count
+        case_progress = (
+            f"{case_start}/{total_case_count}"
+            if case_start == case_end
+            else f"{case_start}-{case_end}/{total_case_count}"
+        )
+        emit(f"[사이트 {index}/{total} | 케이스 {case_progress}] {preset.label} 실행 중")
+        first_scenario = _first_scenario(suite_payload)
+        battle_scenario_label = ""
+        battle_run_id = ""
+        if battle_web_config is not None:
+            battle_scenario_label, _, battle_run_id = _post_battle_session_start(
+                config=battle_web_config,
+                scenario=first_scenario,
+                emit=emit,
+            )
+        result = run_suite_handler(
+            workspace_root=workspace_root,
+            preset=preset,
+            target_url=selected_url,
+            suite_payload=suite_payload,
+            emit=emit,
+            run_tag="full_suite",
+            push_metrics=push_metrics_for_run,
+            runner_id=runner_id,
+            battle_board=battle_board,
+            battle_upload_url=battle_web_config.upload_url if battle_web_config is not None else "",
+            battle_session_id=battle_web_config.session_id if battle_web_config is not None else "",
+            battle_upload_token=battle_web_config.upload_token if battle_web_config is not None else "",
+            battle_scenario_label=battle_scenario_label,
+            battle_run_id=battle_run_id,
+        )
+        status = str(result.get("status") or "").strip().lower()
+        if status == "success":
+            success_count += 1
+        elif status in {"empty", "missing_suite", "missing_manifest"}:
+            skipped_count += 1
+        else:
+            failed_count += 1
+        completed_case_count += site_case_count
+
+    emit(
+        "GAIA_VS_HUMAN 전체 사이트 전체 테스트 완료"
+        f" | success={success_count}"
+        f" | failed={failed_count}"
+        f" | skipped={skipped_count}"
+    )
+
+
+def _load_terminal_suite_payload(
+    *,
+    workspace_root: Path,
+    preset: BenchmarkPreset,
+    selected_url: str,
+    site_entry: Mapping[str, Any],
+    emit: OutputFn,
+) -> dict[str, Any] | None:
+    suite_path_text = str(preset.suite_path or "").strip()
+    if not suite_path_text:
+        emit("선택한 사이트에 benchmark suite가 등록되어 있지 않습니다.")
+        return None
+    suite_path = (workspace_root / suite_path_text).resolve()
+    try:
+        return load_suite_payload(workspace_root, suite_path_text)
+    except FileNotFoundError:
+        if not bool(site_entry.get("is_custom")):
+            emit(f"benchmark suite 파일을 찾지 못했습니다: {suite_path}")
+            return None
+        payload = create_custom_suite_payload(
+            site_key=preset.key,
+            label=preset.label,
+            default_url=selected_url or preset.default_url,
+        )
+        save_suite_payload(suite_path, payload)
+        emit(f"비어 있는 커스텀 테스트 suite를 새로 만들었습니다: {suite_path}")
+        return payload
+
+
+def _try_auto_pull_shared_suite(
+    *,
+    workspace_root: Path,
+    preset: BenchmarkPreset,
+    selected_url: str,
+    site_entry: Mapping[str, Any],
+    emit: OutputFn,
+    monitoring_config_path: Path | None = None,
+) -> None:
+    config = _load_monitoring_config(monitoring_config_path) or {}
+    server = str(config.get("server") or "").strip()
+    token = str(config.get("token") or "").strip() or None
+    if not server:
+        return
+    try:
+        remote_payload = download_shared_suite(server=server, token=token, suite_key=preset.key)
+    except SharedSuiteNotFound:
+        return
+    except SharedSuiteError as exc:
+        emit(f"팀 공유 테스트 자동 가져오기를 건너뜁니다: {exc}")
+        return
+
+    suite_path_text = str(preset.suite_path or "").strip()
+    if not suite_path_text:
+        return
+    suite_path = (workspace_root / suite_path_text).resolve()
+    try:
+        local_payload = load_suite_payload(workspace_root, suite_path_text)
+    except FileNotFoundError:
+        if not bool(site_entry.get("is_custom")):
+            return
+        local_payload = create_custom_suite_payload(
+            site_key=preset.key,
+            label=preset.label,
+            default_url=selected_url or preset.default_url,
+        )
+    except ValueError as exc:
+        emit(f"팀 공유 테스트 자동 가져오기를 건너뜁니다: {exc}")
+        return
+
+    merged, stats = merge_shared_suite_payload(local_payload, remote_payload)
+    if stats.added == 0 and stats.updated == 0:
+        return
+    save_suite_payload(suite_path, merged)
+    emit(f"팀 공유 테스트 자동 가져오기 완료: 추가 {stats.added}개, 업데이트 {stats.updated}개")
+
+
+def _monitoring_config_path(path: Path | None = None) -> Path:
+    return path if path is not None else Path.home() / ".gaia" / "monitoring.json"
+
+
+def _load_monitoring_config(path: Path | None = None) -> dict[str, Any] | None:
+    config_path = _monitoring_config_path(path)
+    if not config_path.exists():
+        return None
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _grafana_url_from_monitoring_config(path: Path | None = None) -> str:
+    payload = _load_monitoring_config(path)
+    if not payload:
+        return ""
+    server = str(payload.get("server") or "").strip()
+    if not server:
+        return ""
+    parsed = urllib.parse.urlsplit(server)
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    try:
+        configured_port = parsed.port
+    except ValueError:
+        return ""
+    port = 3000 if configured_port in {None, 9091} else configured_port
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = f"{hostname}:{port}"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, "/d/gaia-kpi-v1/gaia-benchmark-results", "", ""))
+
+
+def _handle_metrics_view(
+    *,
+    workspace_root: Path,
+    preset: BenchmarkPreset,
+    selected_url: str,
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    report_writer: Callable[..., Path],
+    report_opener: Callable[[Path], bool],
+    grafana_opener: GrafanaOpener,
+    record_pruner: RecordPruner,
+    monitoring_config_path: Path | None = None,
+) -> None:
+    selected = prompt_select(
+        "지표 확인 위치를 선택하세요",
+        (GRAFANA_METRICS_OPTION, LOCAL_REPORT_OPTION, DELETE_FAILED_REPORTS_OPTION, METRICS_BACK_OPTION),
+        default=GRAFANA_METRICS_OPTION,
+    )
+    if selected == METRICS_BACK_OPTION:
+        return
+    if selected == LOCAL_REPORT_OPTION:
+        report_path = report_writer(
+            workspace_root=workspace_root,
+            preset=preset,
+            selected_url=selected_url,
+        )
+        report_opener(report_path)
+        emit(f"📊 로컬 결과 보드 생성: {report_path}")
+        return
+    if selected == DELETE_FAILED_REPORTS_OPTION:
+        preview = record_pruner(
+            workspace_root=workspace_root,
+            site_key=preset.key,
+            selected_url=selected_url,
+            failed_only=True,
+            dry_run=True,
+            preset=preset,
+        )
+        delete_count = int(preview.get("deleted") or 0)
+        if delete_count <= 0:
+            emit("삭제할 실패 기록이 없습니다.")
+            return
+        confirm = prompt_select(
+            f"실패 기록 {delete_count}개를 삭제할까요?",
+            (CONFIRM_DELETE_FAILED_REPORTS_OPTION, METRICS_BACK_OPTION),
+            default=METRICS_BACK_OPTION,
+        )
+        if confirm != CONFIRM_DELETE_FAILED_REPORTS_OPTION:
+            emit("실패 기록 삭제를 취소했습니다.")
+            return
+        result = record_pruner(
+            workspace_root=workspace_root,
+            site_key=preset.key,
+            selected_url=selected_url,
+            failed_only=True,
+            dry_run=False,
+            preset=preset,
+        )
+        emit(f"🗑️ 실패 기록 삭제 완료: {int(result.get('deleted') or 0)}개")
+        return
+
+    if not _ensure_monitoring_connection(
+        prompt_select=prompt_select,
+        prompt_non_empty=prompt_non_empty,
+        emit=emit,
+        workspace_root=workspace_root,
+        monitoring_config_path=monitoring_config_path,
+    ):
+        return
+    grafana_url = _grafana_url_from_monitoring_config(monitoring_config_path)
+    if not grafana_url:
+        emit("Grafana URL을 만들 수 없습니다. 모니터링 연결을 다시 설정해주세요.")
+        _emit_monitoring_connect_command(emit)
+        return
+    grafana_opener(grafana_url)
+    emit(f"📊 Grafana 대시보드 열기: {grafana_url}")
+
+
+def _handle_team_suite_sharing(
+    *,
+    workspace_root: Path,
+    preset: BenchmarkPreset,
+    suite_path: Path,
+    suite_payload: Mapping[str, Any],
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    monitoring_config_path: Path | None = None,
+) -> None:
+    selected = prompt_select(
+        "팀 테스트 공유 작업을 선택하세요",
+        (PULL_SHARED_TESTS_OPTION, UPLOAD_SHARED_TESTS_OPTION, "이전으로"),
+        default=PULL_SHARED_TESTS_OPTION,
+    )
+    if selected == "이전으로":
+        return
+    if not _ensure_monitoring_connection(
+        prompt_select=prompt_select,
+        prompt_non_empty=prompt_non_empty,
+        emit=emit,
+        workspace_root=workspace_root,
+        monitoring_config_path=monitoring_config_path,
+    ):
+        return
+    config = _load_monitoring_config(monitoring_config_path) or {}
+    server = str(config.get("server") or "").strip()
+    token = str(config.get("token") or "").strip() or None
+    if not server:
+        emit("모니터링 서버 설정을 읽지 못했습니다. 연결을 다시 설정해주세요.")
+        _emit_monitoring_connect_command(emit)
+        return
+
+    if selected == UPLOAD_SHARED_TESTS_OPTION:
+        if not _suite_has_scenarios(suite_payload):
+            emit("공유할 테스트가 없습니다. 먼저 테스트를 추가해주세요.")
+            return
+        try:
+            upload_shared_suite(server=server, token=token, suite_key=preset.key, suite_payload=suite_payload)
+        except SharedSuiteError as exc:
+            emit(f"팀 테스트 공유 실패: {exc}")
+            return
+        emit(f"팀 테스트 공유 완료: {preset.label} ({_scenario_count(suite_payload)}개)")
+        return
+
+    try:
+        remote_payload = download_shared_suite(server=server, token=token, suite_key=preset.key)
+    except SharedSuiteNotFound:
+        emit("팀 서버에 공유된 테스트가 아직 없습니다. 먼저 누군가 '내 테스트 올리기'를 해야 합니다.")
+        return
+    except SharedSuiteError as exc:
+        emit(f"팀 테스트 가져오기 실패: {exc}")
+        return
+
+    merged, stats = merge_shared_suite_payload(suite_payload, remote_payload)
+    save_suite_payload(suite_path, merged)
+    emit(
+        "팀 테스트 가져오기 완료: "
+        f"추가 {stats.added}개, 업데이트 {stats.updated}개, 로컬 유지 {stats.local_only}개"
+    )
+
+
+def _resolve_push_metrics_for_run(
+    *,
+    push_metrics: bool,
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    workspace_root: Path,
+    monitoring_config_path: Path | None = None,
+) -> bool:
+    if push_metrics:
+        return _ensure_monitoring_connection(
+            prompt_select=prompt_select,
+            prompt_non_empty=prompt_non_empty,
+            emit=emit,
+            workspace_root=workspace_root,
+            monitoring_config_path=monitoring_config_path,
+        )
+    return _prompt_push_metrics(
+        prompt_select=prompt_select,
+        prompt_non_empty=prompt_non_empty,
+        emit=emit,
+        workspace_root=workspace_root,
+        monitoring_config_path=monitoring_config_path,
+    )
+
+
+def _prompt_push_metrics(
+    *,
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    workspace_root: Path,
+    monitoring_config_path: Path | None = None,
+) -> bool:
+    selected = prompt_select(
+        "모니터링 서버로 메트릭을 업로드할까요?",
+        (PUSH_METRICS_OPTION, LOCAL_METRICS_OPTION),
+        default=LOCAL_METRICS_OPTION,
+    )
+    if selected != PUSH_METRICS_OPTION:
+        return False
+    return _ensure_monitoring_connection(
+        prompt_select=prompt_select,
+        prompt_non_empty=prompt_non_empty,
+        emit=emit,
+        workspace_root=workspace_root,
+        monitoring_config_path=monitoring_config_path,
+    )
+
+
+def _ensure_monitoring_connection(
+    *,
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    workspace_root: Path,
+    monitoring_config_path: Path | None = None,
+) -> bool:
+    config_path = _monitoring_config_path(monitoring_config_path)
+    if config_path.exists():
+        return True
+
+    emit("모니터링 서버 연결이 없습니다.")
+    selected = prompt_select(
+        "모니터링 서버 연결",
+        (CONNECT_MONITORING_OPTION, SHOW_CONNECT_COMMAND_OPTION, LOCAL_METRICS_OPTION),
+        default=CONNECT_MONITORING_OPTION,
+    )
+    if selected == LOCAL_METRICS_OPTION:
+        return False
+    if selected == SHOW_CONNECT_COMMAND_OPTION:
+        _emit_monitoring_connect_command(emit)
+        return False
+
+    server = str(prompt_non_empty("모니터링 서버 주소", default=None)).strip()
+    token = str(prompt_non_empty("팀 공유 토큰", default=None)).strip()
+    connect_script = workspace_root / "scripts" / "gaia_monitor_connect.py"
+    result = subprocess.run(
+        [sys.executable, str(connect_script), server, "--token", token],
+        cwd=str(workspace_root),
+        check=False,
+    )
+    if result.returncode != 0:
+        emit("모니터링 서버 연결에 실패했습니다. 이번 실행은 로컬 artifact만 저장합니다.")
+        return False
+    return config_path.exists()
+
+
+def _ensure_monitoring_connection_required(
+    *,
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+    emit: OutputFn,
+    workspace_root: Path,
+    monitoring_config_path: Path | None = None,
+) -> bool:
+    config_path = _monitoring_config_path(monitoring_config_path)
+    if config_path.exists():
+        return True
+
+    emit("전체사이트 전체케이스 실행은 Grafana 업로드가 기본입니다. 먼저 모니터링 서버에 연결합니다.")
+    selected = prompt_select(
+        "모니터링 서버 연결",
+        (CONNECT_MONITORING_OPTION, SHOW_CONNECT_COMMAND_OPTION, METRICS_BACK_OPTION),
+        default=CONNECT_MONITORING_OPTION,
+    )
+    if selected == SHOW_CONNECT_COMMAND_OPTION:
+        _emit_monitoring_connect_command(emit)
+        return False
+    if selected == METRICS_BACK_OPTION:
+        return False
+
+    server = str(prompt_non_empty("모니터링 서버 주소", default=None)).strip()
+    token = str(prompt_non_empty("팀 공유 토큰", default=None)).strip()
+    connect_script = workspace_root / "scripts" / "gaia_monitor_connect.py"
+    result = subprocess.run(
+        [sys.executable, str(connect_script), server, "--token", token],
+        cwd=str(workspace_root),
+        check=False,
+    )
+    if result.returncode != 0:
+        emit("모니터링 서버 연결에 실패했습니다. 전체 benchmark 실행을 시작하지 않습니다.")
+        return False
+    return config_path.exists()
+
+
+def _emit_monitoring_connect_command(emit: OutputFn) -> None:
+    emit("다른 터미널에서 아래 명령으로 먼저 연결하세요.")
+    emit("python scripts/gaia_monitor_connect.py http://<server-ip>:9091 --token <team-token>")
+    emit("연결 후 벤치마크를 다시 실행하거나, 결과 artifact를 수동 업로드할 수 있습니다.")
+
+
+def _select_scenario_id(
+    *,
+    suite_payload: Mapping[str, Any],
+    prompt_select: PromptSelectFn,
+    emit: OutputFn,
+) -> str | None:
+    labels = build_scenario_labels(suite_payload)
+    if not labels:
+        emit("등록된 테스트가 없습니다. 먼저 테스트를 추가해주세요.")
+        return None
+    selection = prompt_select(
+        "테스트를 선택하세요",
+        tuple(labels) + ("이전으로",),
+        default=labels[0],
+    )
+    if selection == "이전으로":
+        return None
+    return selection.split(" | ", 1)[0].strip()
+
+
+def _scenario_count(suite_payload: Mapping[str, Any]) -> int:
+    return sum(1 for row in list(suite_payload.get("scenarios") or []) if isinstance(row, Mapping))
+
+
+def _select_benchmark_url(
+    *,
+    registry: Mapping[str, Any],
+    site_entry: Mapping[str, Any],
+    preset: BenchmarkPreset,
+    prompt_select: PromptSelectFn,
+    prompt_non_empty: PromptTextFn,
+) -> tuple[str | None, dict[str, Any]]:
+    urls = build_url_history(site_entry)
+    default_url = str(site_entry.get("default_url") or preset.default_url).strip() or preset.default_url
+    options = tuple(urls + ["직접 입력", "이전으로"])
+    selected = prompt_select(
+        f"{preset.label} 대상 링크를 선택하세요",
+        options,
+        default=default_url if default_url in options else (urls[0] if urls else "직접 입력"),
+    )
+    if selected == "이전으로":
+        return None, dict(registry)
+    if selected == "직접 입력":
+        selected = str(prompt_non_empty("벤치 링크를 입력하세요", default=default_url or None)).strip()
+    updated = upsert_benchmark_site_url(registry, preset.key, selected)
+    return selected, updated
+
+
+def _slugify(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip()).strip("-").lower() or "benchmark"
+
+
+def _run_scenario_form_worker(request_path: str) -> int:
+    payload = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("scenario form worker payload must be an object")
+    result = _open_scenario_form_pyside_inline(
+        emit=lambda _message: None,
+        existing=dict(payload.get("existing") or {}),
+        existing_ids={str(item).strip() for item in list(payload.get("existing_ids") or []) if str(item).strip()},
+        default_url=str(payload.get("default_url") or ""),
+        title=str(payload.get("title") or "새 테스트 추가"),
+    )
+    if result is None:
+        return 2
+    sys.stdout.write(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
+    args = list(argv or [])
+    if len(args) == 2 and args[0] == "--scenario-form-worker":
+        return _run_scenario_form_worker(args[1])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))

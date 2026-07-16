@@ -1,0 +1,873 @@
+"""Qt workers for goal-driven and exploratory automation."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+from PySide6.QtCore import QObject, Signal
+
+from gaia.src.phase4.goal_driven import (
+    ExplorationConfig,
+    ExploratoryAgent,
+    GoalDrivenAgent,
+    TestGoal,
+    sort_goals_by_priority,
+)
+from gaia.src.phase4.goal_driven.adaptive_qa_runtime import (
+    ADAPTIVE_QA_MODE,
+    DEEP_ADAPTIVE_QA_MODE,
+    adaptive_qa_enabled,
+    adaptive_qa_is_deep,
+    adaptive_qa_mode,
+    build_edge_goal,
+    classify_adaptive_edge_status,
+    filter_new_edge_cases,
+    generate_adaptive_qa_plan,
+    is_adaptive_edge_goal,
+    merge_adaptive_qa_plans,
+    summarize_adaptive_qa_report,
+)
+from gaia.src.phase4.goal_driven.multi_user_interaction_runtime import close_participant_browser_contexts
+from gaia.src.tracker.checklist import ChecklistTracker
+from gaia.src.utils.config import CONFIG
+from gaia.src.gui.benchmark_mode import override_suite_urls
+
+BATTLE_DEFAULT_SITE_URL = "https://gaia-battle-web.vercel.app"
+BATTLE_DEFAULT_SESSION_ID = "battle-live"
+FAST_MODE_APP_SERVER_ARGS = '-c service_tier="priority"'
+
+
+def _goal_step_timeline(result: Any, goal_name: str) -> list[dict[str, Any]]:
+    timeline: list[dict[str, Any]] = []
+    for step in list(getattr(result, "steps_taken", []) or []):
+        action = getattr(getattr(step, "action", None), "action", None)
+        reasoning = getattr(getattr(step, "action", None), "reasoning", "") or ""
+        action_value = getattr(action, "value", None) if action is not None else None
+        try:
+            duration_seconds = round(float(getattr(step, "duration_ms", 0) or 0) / 1000.0, 2)
+        except Exception:
+            duration_seconds = 0.0
+        timeline.append(
+            {
+                "goal": goal_name,
+                "step": getattr(step, "step_number", None),
+                "action": action_value or str(action or "-"),
+                "duration_seconds": duration_seconds,
+                "reasoning": str(reasoning).strip(),
+                "success": bool(getattr(step, "success", False)),
+                "error": str(getattr(step, "error_message", "") or "").strip(),
+            }
+        )
+    return timeline
+
+
+def _exploration_step_timeline(result: Any) -> list[dict[str, Any]]:
+    timeline: list[dict[str, Any]] = []
+    for step in list(getattr(result, "steps", []) or []):
+        decision = getattr(step, "decision", None)
+        selected = getattr(decision, "selected_action", None)
+        try:
+            duration_seconds = round(float(getattr(step, "duration_ms", 0) or 0) / 1000.0, 2)
+        except Exception:
+            duration_seconds = 0.0
+        timeline.append(
+            {
+                "step": getattr(step, "step_number", None),
+                "action": str(getattr(selected, "action_type", "") or "-").strip() or "-",
+                "duration_seconds": duration_seconds,
+                "reasoning": str(
+                    getattr(decision, "reasoning", "")
+                    or getattr(step, "feature_description", "")
+                    or getattr(step, "test_scenario", "")
+                    or ""
+                ).strip(),
+                "success": bool(getattr(step, "success", False)),
+                "error": str(getattr(step, "error_message", "") or "").strip(),
+            }
+        )
+    return timeline
+
+
+class GoalDrivenWorker(QObject):
+    """Run goal-driven automation in a background thread."""
+
+    progress = Signal(str)
+    screenshot = Signal(str, object)  # (base64, click_position dict 또는 None)
+    scenario_started = Signal(str)
+    scenario_finished = Signal(str)
+    result_ready = Signal(object)
+    finished = Signal()
+
+    def __init__(
+        self,
+        url: str,
+        goals: Sequence[TestGoal],
+        *,
+        tracker: ChecklistTracker | None = None,
+        fallback_actions: int = 8,
+        session_id: str | None = None,
+        mcp_host_url: str | None = None,
+        intervention_callback: Optional[Callable[[dict[str, Any]], Optional[dict[str, Any]]]] = None,
+    ) -> None:
+        super().__init__()
+        self._base_url = url
+        self._goals = sort_goals_by_priority(list(goals))
+        self._tracker = tracker
+        self._fallback_actions = max(0, int(fallback_actions))
+        self._cancel_requested = False
+        self._session_id = session_id or f"goal_ui_{int(time.time())}"
+        self._mcp_host_url = mcp_host_url or CONFIG.mcp.host_url
+        self._intervention_callback = intervention_callback
+
+        self._goal_agent = GoalDrivenAgent(
+            mcp_host_url=self._mcp_host_url,
+            session_id=self._session_id,
+            log_callback=self._on_progress,
+            screenshot_callback=self._on_screenshot,
+            intervention_callback=self._intervention_callback,
+        )
+
+    def start(self) -> None:
+        successful_goals = 0
+        failed_goals = 0
+        last_reason = ""
+        goal_summaries: list[dict[str, Any]] = []
+        timeline_rows: list[dict[str, Any]] = []
+        adaptive_qa_reports: list[dict[str, Any]] = []
+        try:
+            if not self._goals:
+                self.progress.emit("ℹ️ 실행할 목표가 없습니다.")
+                self.result_ready.emit(
+                    {
+                        "mode": "goal",
+                        "status": "skipped",
+                        "reason": "실행할 목표가 없습니다.",
+                        "total_goals": 0,
+                        "successful_goals": 0,
+                        "failed_goals": 0,
+                        "goals": [],
+                    }
+                )
+                return
+
+            self.progress.emit(f"🎯 Goal-Driven 자동화를 시작합니다 ({len(self._goals)}개 목표)")
+
+            for index, goal in enumerate(self._goals, start=1):
+                if self._cancel_requested:
+                    self.progress.emit("⏹️ Goal-Driven 실행이 취소되었습니다.")
+                    last_reason = "사용자 요청으로 실행이 취소되었습니다."
+                    break
+
+                goal_to_run = goal
+                if index == 1 and not goal.start_url:
+                    goal_to_run = goal.model_copy(update={"start_url": self._base_url})
+
+                self.scenario_started.emit(goal_to_run.id)
+                self.progress.emit(
+                    f"[{index}/{len(self._goals)}] {goal_to_run.priority} - {goal_to_run.name}"
+                )
+
+                result = self._goal_agent.execute_goal(goal_to_run)
+
+                if not result.success and self._fallback_actions > 0 and not self._cancel_requested:
+                    self.progress.emit(
+                        f"🔎 목표 실패 → 탐색 모드로 전환 ({self._fallback_actions} 액션)"
+                    )
+                    exploration_config = ExplorationConfig(
+                        max_actions=self._fallback_actions,
+                        max_depth=2,
+                        non_stop_mode=True,
+                    )
+                    exploratory_agent = ExploratoryAgent(
+                        mcp_host_url=self._mcp_host_url,
+                        session_id=self._session_id,
+                        config=exploration_config,
+                        log_callback=self._on_exploration_progress,
+                        screenshot_callback=self._on_screenshot,
+                    )
+                    exploratory_agent.explore(self._base_url)
+                    self.progress.emit("🔁 목표를 다시 시도합니다.")
+                    result = self._goal_agent.execute_goal(goal_to_run)
+
+                last_reason = result.final_reason or last_reason
+                status = "success" if result.success else "failed"
+                if self._tracker:
+                    self._tracker.set_status(goal_to_run.id, status, evidence=result.final_reason)
+
+                if result.success:
+                    successful_goals += 1
+                    self.progress.emit(f"   ✅ 목표 달성: {goal_to_run.name}")
+                else:
+                    failed_goals += 1
+                    self.progress.emit(f"   ❌ 목표 실패: {goal_to_run.name}")
+                    self.progress.emit(f"      이유: {result.final_reason}")
+
+                goal_timeline = _goal_step_timeline(result, goal_to_run.name)
+                goal_summary = {
+                    "id": goal_to_run.id,
+                    "name": goal_to_run.name,
+                    "status": status,
+                    "reason": result.final_reason,
+                    "steps": int(result.total_steps or 0),
+                    "step_timeline": goal_timeline,
+                }
+                timeline_rows.extend(goal_timeline)
+                if adaptive_qa_enabled(goal_to_run) and not is_adaptive_edge_goal(goal_to_run):
+                    adaptive_report = self._run_adaptive_qa_expansion(goal_to_run, result)
+                    if adaptive_report:
+                        adaptive_qa_reports.append(adaptive_report)
+                        goal_summary["adaptive_qa_report"] = adaptive_report
+                        for edge_result in list(adaptive_report.get("edge_results") or []):
+                            timeline_rows.append(
+                                {
+                                    "goal": str(edge_result.get("name") or ""),
+                                    "step": "edge",
+                                    "action": "adaptive_qa",
+                                    "duration_seconds": 0.0,
+                                    "reasoning": str(edge_result.get("reason") or ""),
+                                    "success": str(edge_result.get("status") or "").lower() == "pass",
+                                    "error": "",
+                                }
+                            )
+                goal_summaries.append(goal_summary)
+                self.scenario_finished.emit(goal_to_run.id)
+
+            summary_status = "success"
+            if self._cancel_requested:
+                summary_status = "cancelled"
+            elif failed_goals > 0:
+                summary_status = "failed"
+
+            self.result_ready.emit(
+                {
+                    "mode": (
+                        str(adaptive_qa_reports[0].get("mode") or ADAPTIVE_QA_MODE)
+                        if adaptive_qa_reports
+                        else "goal"
+                    ),
+                    "status": summary_status,
+                    "reason": last_reason or ("모든 목표가 완료되었습니다." if summary_status == "success" else "일부 목표가 실패했습니다."),
+                    "total_goals": len(self._goals),
+                    "successful_goals": successful_goals,
+                    "failed_goals": failed_goals,
+                    "goals": goal_summaries,
+                    "current_goal": goal_summaries[-1]["name"] if goal_summaries else "",
+                    "current_step": f"{sum(int(row.get('steps') or 0) for row in goal_summaries)}단계 완료" if goal_summaries else "-",
+                    "blocked_reason": "",
+                    "step_timeline": timeline_rows[:20],
+                    "proof_lines": [
+                        f"{row.get('name')}: {row.get('reason')}"
+                        for row in goal_summaries[-5:]
+                        if isinstance(row, dict)
+                    ],
+                    "adaptive_qa_reports": adaptive_qa_reports,
+                }
+            )
+        except Exception as exc:
+            self.progress.emit(f"❌ Goal-Driven 실행 중 오류: {exc}")
+            self.result_ready.emit(
+                {
+                    "mode": "goal",
+                    "status": "failed",
+                    "reason": str(exc),
+                    "total_goals": len(self._goals),
+                    "successful_goals": successful_goals,
+                    "failed_goals": max(1, failed_goals),
+                    "goals": goal_summaries,
+                    "current_goal": goal_summaries[-1]["name"] if goal_summaries else "",
+                    "current_step": "-",
+                    "blocked_reason": "",
+                    "step_timeline": timeline_rows[:20],
+                    "proof_lines": [
+                        f"{row.get('name')}: {row.get('reason')}"
+                        for row in goal_summaries[-5:]
+                        if isinstance(row, dict)
+                    ],
+                }
+            )
+        finally:
+            try:
+                close_participant_browser_contexts(self._goal_agent)
+            except Exception:
+                pass
+            self.finished.emit()
+
+    def _run_adaptive_qa_expansion(self, goal: TestGoal, primary_result: Any) -> dict[str, Any]:
+        mode = adaptive_qa_mode(goal) or ADAPTIVE_QA_MODE
+        label = "Deep QA" if mode == DEEP_ADAPTIVE_QA_MODE else "Adaptive QA"
+        self.progress.emit(f"🧪 {label}: 체크리스트와 안전 엣지 케이스를 생성합니다.")
+        is_deep = adaptive_qa_is_deep(goal)
+        plans: list[dict[str, Any]] = []
+        generated_edge_cases: list[dict[str, Any]] = []
+        seen_edge_fingerprints: set[str] = set()
+        edge_results: list[dict[str, Any]] = []
+        round_index = 1
+        while not self._cancel_requested:
+            dom = self._goal_agent._analyze_dom() or []
+            plan = generate_adaptive_qa_plan(
+                self._goal_agent,
+                goal=goal,
+                primary_result=primary_result,
+                dom_elements=dom,
+                previous_edge_cases=generated_edge_cases,
+                round_index=round_index,
+            )
+            plans.append(plan)
+            raw_edge_cases = list(plan.get("edge_cases") or []) if isinstance(plan, dict) else []
+            edge_cases = filter_new_edge_cases(raw_edge_cases, seen_edge_fingerprints)
+            if not primary_result.success or not edge_cases:
+                self.progress.emit(f"🧪 {label}: 새로 실행할 안전 엣지 케이스가 없습니다.")
+                break
+            self.progress.emit(
+                f"🧪 {label}: round {round_index} 안전 엣지 케이스 {len(edge_cases)}개 실행"
+            )
+            for edge_case in edge_cases:
+                if self._cancel_requested:
+                    break
+                generated_edge_cases.append(edge_case)
+                edge_goal = build_edge_goal(goal, edge_case, index=len(edge_results) + 1)
+                self.progress.emit(f"   [{len(edge_results) + 1}] {edge_goal.name}")
+                result = self._goal_agent.execute_goal(edge_goal)
+                edge_status = classify_adaptive_edge_status(edge_case, result)
+                edge_results.append(
+                    {
+                        "id": edge_goal.id,
+                        "name": edge_goal.name,
+                        "status": edge_status,
+                        "reason": result.final_reason,
+                        "steps": int(result.total_steps or 0),
+                    }
+                )
+                self.progress.emit(f"      {edge_status}: {result.final_reason}")
+            if not is_deep:
+                break
+            round_index += 1
+        merged_plan = merge_adaptive_qa_plans(plans)
+        merged_plan["edge_cases"] = generated_edge_cases
+        return summarize_adaptive_qa_report(
+            primary_goal=goal,
+            primary_result=primary_result,
+            plan=merged_plan,
+            edge_results=edge_results,
+        )
+
+    def _on_progress(self, message: str) -> None:
+        self.progress.emit(message)
+
+    def _on_exploration_progress(self, message: str) -> None:
+        self.progress.emit(f"[탐색] {message}")
+
+    def _on_screenshot(self, screenshot_base64: str, click_position: dict | None = None) -> None:
+        self.screenshot.emit(screenshot_base64, click_position)
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def apply_steering_policy(self, policy: dict[str, Any]) -> None:
+        if not isinstance(policy, dict) or not policy:
+            return
+        try:
+            ttl = int(policy.get("ttl_remaining") or policy.get("ttl_steps") or 0)
+        except Exception:
+            ttl = 0
+        self._goal_agent._steering_policy = dict(policy)
+        self._goal_agent._steering_remaining_steps = max(0, ttl)
+        self._goal_agent._steering_infeasible_block = False
+
+
+class ExploratoryWorker(QObject):
+    """Run exploratory automation in a background thread."""
+
+    progress = Signal(str)
+    screenshot = Signal(str, object)
+    result_ready = Signal(object)
+    finished = Signal()
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        max_actions: int = 50,
+        session_id: str | None = None,
+        mcp_host_url: str | None = None,
+        user_intervention_callback: Optional[Callable[[str, str], bool]] = None,
+    ) -> None:
+        super().__init__()
+        self._url = url
+        self._max_actions = max(1, int(max_actions))
+        self._cancel_requested = False
+        self._session_id = session_id or f"explore_ui_{int(time.time())}"
+        self._mcp_host_url = mcp_host_url or CONFIG.mcp.host_url
+        self._user_intervention_callback = user_intervention_callback
+
+    def start(self) -> None:
+        try:
+            if self._cancel_requested:
+                self.progress.emit("⏹️ Exploratory 실행이 취소되었습니다.")
+                self.result_ready.emit(
+                    {
+                        "mode": "exploratory",
+                        "status": "cancelled",
+                        "reason": "사용자 요청으로 실행이 취소되었습니다.",
+                        "total_actions": 0,
+                        "pages": 0,
+                        "issues": 0,
+                        "current_goal": "완전 자율 탐색",
+                        "current_step": "-",
+                        "blocked_reason": "",
+                        "step_timeline": [],
+                        "proof_lines": [],
+                    }
+                )
+                return
+            self.progress.emit(f"🔍 Exploratory 모드를 시작합니다 (최대 {self._max_actions} 액션)")
+            agent = ExploratoryAgent(
+                mcp_host_url=self._mcp_host_url,
+                session_id=self._session_id,
+                config=ExplorationConfig(
+                    max_actions=self._max_actions,
+                    non_stop_mode=True,
+                ),
+                log_callback=self._on_progress,
+                screenshot_callback=self._on_screenshot,
+                user_intervention_callback=self._user_intervention_callback,
+            )
+            result = agent.explore(self._url)
+
+            self.progress.emit("✅ Exploratory 모드 종료")
+            self.progress.emit(f"   - 총 액션: {result.total_actions}")
+            self.progress.emit(f"   - 방문 페이지: {result.total_pages_visited}")
+            self.progress.emit(f"   - 발견 이슈: {len(result.issues_found)}개")
+            self.result_ready.emit(
+                {
+                    "mode": "exploratory",
+                    "status": "success",
+                    "reason": "자율 탐색이 완료되었습니다.",
+                    "total_actions": int(result.total_actions or 0),
+                    "pages": int(result.total_pages_visited or 0),
+                    "issues": len(result.issues_found),
+                    "current_goal": "완전 자율 탐색",
+                    "current_step": f"{int(result.total_actions or 0)}액션 완료",
+                    "blocked_reason": "",
+                    "step_timeline": _exploration_step_timeline(result)[:20],
+                    "proof_lines": [
+                        f"방문 페이지 {int(result.total_pages_visited or 0)}개",
+                        f"테스트 요소 {int(result.total_elements_tested or 0)}개",
+                        f"발견 이슈 {len(result.issues_found)}개",
+                    ],
+                    "validation_summary": dict(getattr(result, "validation_summary", {}) or {}),
+                }
+            )
+        except Exception as exc:
+            self.progress.emit(f"❌ Exploratory 실행 중 오류: {exc}")
+            self.result_ready.emit(
+                {
+                    "mode": "exploratory",
+                    "status": "failed",
+                    "reason": str(exc),
+                    "total_actions": 0,
+                    "pages": 0,
+                    "issues": 0,
+                    "current_goal": "완전 자율 탐색",
+                    "current_step": "-",
+                    "blocked_reason": "",
+                    "step_timeline": [],
+                    "proof_lines": [],
+                }
+            )
+        finally:
+            self.finished.emit()
+
+    def _on_progress(self, message: str) -> None:
+        self.progress.emit(message)
+
+    def _on_screenshot(self, screenshot_base64: str, click_position: dict | None = None) -> None:
+        self.screenshot.emit(screenshot_base64, click_position)
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+
+def _normalize_battle_site_url(raw: str) -> str:
+    value = str(raw or "").strip().rstrip("/")
+    return value or BATTLE_DEFAULT_SITE_URL
+
+
+def _first_scenario(suite_payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    for raw in list(suite_payload.get("scenarios") or []):
+        if isinstance(raw, Mapping):
+            return dict(raw)
+    return None
+
+
+def _battle_scenario_label(scenario: Mapping[str, Any] | None, *, fallback: str = "현장 QA 미션") -> str:
+    current = scenario if isinstance(scenario, Mapping) else {}
+    for key in ("scenario_label", "goal", "description", "name", "title"):
+        text = str(current.get(key) or "").strip()
+        if text:
+            return text[:180]
+    scenario_id = str(current.get("id") or "").strip()
+    return scenario_id or fallback
+
+
+def _post_battle_session_start(
+    *,
+    site_url: str,
+    session_id: str,
+    scenario: Mapping[str, Any] | None,
+    emit: Callable[[str], None],
+) -> tuple[str, bool, str]:
+    scenario_id = str((scenario or {}).get("id") or "live-mission").strip() or "live-mission"
+    scenario_label = _battle_scenario_label(scenario)
+    started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    battle_run_id = _battle_run_id_slug(started_at)
+    body = json.dumps(
+        {
+            "sessionId": session_id,
+            "scenarioId": scenario_id,
+            "scenarioLabel": scenario_label,
+            "humanStartedAt": started_at,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{site_url}/api/session",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            ok = 200 <= int(getattr(response, "status", 0) or 0) < 300
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        emit(f"Human vs GAIA 웹 타이머 시작 실패: {exc}")
+        return scenario_label, False, battle_run_id
+    if ok:
+        emit(f"Human 타이머 시작: {scenario_label}")
+    else:
+        emit("Human vs GAIA 웹 타이머 시작 응답이 성공 범위가 아닙니다.")
+    return scenario_label, ok, battle_run_id
+
+
+def _battle_run_id_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9가-힣_-]+", "-", str(value or "").strip().lower()).strip("-")
+
+
+class BenchmarkWorker(QObject):
+    """Run benchmark suites in a background thread for GUI benchmark mode."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    finished = Signal()
+
+    def __init__(
+        self,
+        *,
+        site_key: str,
+        site_label: str,
+        suite_path: str,
+        suite_payload: Mapping[str, Any] | None = None,
+        target_url: str,
+        workspace_root: Path,
+        run_tag: str = "full_suite",
+        timeout_cap: int = 600,
+        push_metrics: bool = False,
+        scenario_ids: list[str] | None = None,
+        run_options: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self._site_key = site_key
+        self._site_label = site_label
+        self._suite_path = str(suite_path)
+        self._suite_payload = dict(suite_payload) if isinstance(suite_payload, Mapping) else None
+        self._target_url = str(target_url or "").strip()
+        self._workspace_root = Path(workspace_root)
+        self._run_tag = str(run_tag or "full_suite").strip() or "full_suite"
+        self._timeout_cap = max(600, int(timeout_cap))
+        self._push_metrics = bool(push_metrics)
+        self._run_options = dict(run_options or {})
+        # 선택된 시나리오 ID 리스트 — None이면 suite의 전체 시나리오 실행, list면 해당 ID만 필터
+        self._scenario_ids = list(scenario_ids) if scenario_ids else None
+        self._cancel_requested = False
+        self._process: subprocess.Popen[str] | None = None
+
+    def start(self) -> None:
+        started = time.time()
+        output_dir: Path | None = None
+        try:
+            suite_path: Path
+            if self._suite_payload is not None:
+                suite_payload = dict(self._suite_payload)
+                suite_path = (self._workspace_root / self._suite_path).resolve() if self._suite_path else (self._workspace_root / "in-memory-suite.json").resolve()
+            else:
+                suite_path = (self._workspace_root / self._suite_path).resolve()
+                if not suite_path.exists():
+                    raise FileNotFoundError(f"benchmark suite not found: {suite_path}")
+                suite_payload = json.loads(suite_path.read_text(encoding="utf-8"))
+                if not isinstance(suite_payload, dict):
+                    raise ValueError("benchmark suite must be a JSON object")
+            overridden = override_suite_urls(suite_payload, self._target_url)
+
+            # scenario_ids 필터 — 선택된 ID만 포함 (None이면 전체 유지)
+            if self._scenario_ids:
+                wanted = set(self._scenario_ids)
+                all_scenarios = overridden.get("scenarios") or []
+                filtered = [s for s in all_scenarios if isinstance(s, dict) and str(s.get("id", "")) in wanted]
+                if not filtered:
+                    raise ValueError(
+                        f"선택한 scenario_id가 suite에 존재하지 않음: {sorted(wanted)} "
+                        f"(suite scenarios: {[s.get('id') for s in all_scenarios]})"
+                    )
+                overridden["scenarios"] = filtered
+                # run_tag에 시나리오 수 반영 (artifacts/tmp 파일명에 사용)
+                self._run_tag = f"selected_{len(filtered)}"
+
+            battle_mode = bool(self._run_options.get("battle_mode"))
+            fast_mode = bool(self._run_options.get("fast_mode"))
+            battle_site_url = _normalize_battle_site_url(
+                str(self._run_options.get("battle_site_url") or "").strip()
+                or os.getenv("GAIA_BATTLE_SITE_URL", "")
+                or BATTLE_DEFAULT_SITE_URL
+            )
+            battle_session_id = (
+                str(self._run_options.get("battle_session_id") or "").strip()
+                or os.getenv("GAIA_BATTLE_SESSION_ID", "").strip()
+                or BATTLE_DEFAULT_SESSION_ID
+            )
+            battle_upload_token = (
+                str(self._run_options.get("battle_upload_token") or "").strip()
+                or os.getenv("GAIA_BATTLE_UPLOAD_TOKEN", "").strip()
+            )
+            battle_scenario_label = ""
+            battle_run_id = ""
+            if battle_mode:
+                battle_scenario_label, _started_ok, battle_run_id = _post_battle_session_start(
+                    site_url=battle_site_url,
+                    session_id=battle_session_id,
+                    scenario=_first_scenario(overridden),
+                    emit=self.progress.emit,
+                )
+
+            tmp_root = self._workspace_root / "artifacts" / "tmp"
+            tmp_root.mkdir(parents=True, exist_ok=True)
+            run_tag = re.sub(r"[^a-zA-Z0-9_]+", "_", self._run_tag).strip("_") or "full_suite"
+            tmp_suite_path = tmp_root / f"{self._site_key}_{run_tag}_gui_suite.json"
+            tmp_suite_path.write_text(json.dumps(overridden, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+            run_id = f"gui_{self._site_key}_{run_tag}_{int(started)}"
+            output_dir = (self._workspace_root / "artifacts" / "benchmarks" / run_id).resolve()
+            cmd = [
+                sys.executable,
+                "scripts/run_goal_benchmark.py",
+                "--suite",
+                str(tmp_suite_path),
+                "--repeats",
+                "1",
+                "--timeout-cap",
+                str(self._timeout_cap),
+                "--session-prefix",
+                f"gui-{self._site_key}",
+                "--output-dir",
+                str(output_dir),
+            ]
+            if self._push_metrics:
+                cmd.append("--push-metrics")
+            if battle_mode:
+                cmd.append("--battle-board")
+                cmd.extend(["--battle-upload-url", f"{battle_site_url}/api/records"])
+                cmd.extend(["--battle-session-id", battle_session_id])
+                if battle_upload_token:
+                    cmd.extend(["--battle-upload-token", battle_upload_token])
+            env = os.environ.copy()
+            env.setdefault("GAIA_RAIL_ENABLED", "0")
+            env.setdefault("GAIA_LLM_MODEL", env.get("GAIA_LLM_MODEL", "gpt-5.5"))
+            if fast_mode:
+                env["GAIA_CODEX_APP_SERVER_ARGS"] = FAST_MODE_APP_SERVER_ARGS
+            else:
+                env.pop("GAIA_CODEX_APP_SERVER_ARGS", None)
+            if battle_mode and battle_scenario_label:
+                env["GAIA_BATTLE_SCENARIO_LABEL"] = battle_scenario_label
+            if battle_mode and battle_run_id:
+                env["GAIA_BATTLE_RUN_ID"] = battle_run_id
+            # Windows에서 subprocess stdout이 버퍼링되어 GUI로 전달이 막히는 문제 방지.
+            # 자식 Python 프로세스의 출력을 즉시 flush하도록 강제.
+            env["PYTHONUNBUFFERED"] = "1"
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            live_preview_path = (
+                self._workspace_root
+                / "artifacts"
+                / "tmp"
+                / "gui_live_preview"
+                / "latest.png"
+            )
+            live_preview_path.parent.mkdir(parents=True, exist_ok=True)
+            env["GAIA_LIVE_PREVIEW_PATH"] = str(live_preview_path)
+
+            self.progress.emit(f"🚀 벤치 실행 시작: {self._site_label}")
+            self.progress.emit(f"   - suite: {suite_path.name}")
+            if self._target_url:
+                self.progress.emit(f"   - target: {self._target_url}")
+            if self._push_metrics:
+                self.progress.emit("   - metrics: upload enabled (--push-metrics)")
+            if battle_mode:
+                self.progress.emit(f"   - battle board: {battle_site_url}/battle/{battle_session_id}")
+                self.progress.emit(f"   - human input: {battle_site_url}/battle/{battle_session_id}/human")
+            self.progress.emit(f"   - fast mode: {'enabled' if fast_mode else 'off'}")
+            self.progress.emit(f"   - cmd: {sys.executable} {' '.join(cmd[1:3])} ...")
+
+            self._process = subprocess.Popen(
+                cmd,
+                cwd=str(self._workspace_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            captured: list[str] = []
+            assert self._process.stdout is not None
+            for raw_line in self._process.stdout:
+                line = str(raw_line or "").rstrip()
+                if not line:
+                    continue
+                captured.append(line)
+                self.progress.emit(line)
+                if self._cancel_requested and self._process.poll() is None:
+                    self._process.terminate()
+                    break
+
+            return_code = self._process.wait()
+            summary_path = output_dir / "summary.json"
+            results_path = output_dir / "results.json"
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+            results_payload = json.loads(results_path.read_text(encoding="utf-8")) if results_path.exists() else []
+
+            status_counts = summary_payload.get("status_counts") if isinstance(summary_payload, dict) else {}
+            status_counts = status_counts if isinstance(status_counts, dict) else {}
+            success_count = int(status_counts.get("SUCCESS") or 0)
+            explicit_fail_count = int(status_counts.get("FAIL") or 0)
+            blocked_count = sum(
+                int(v or 0) for k, v in status_counts.items()
+                if isinstance(k, str) and ("BLOCKED" in k.upper() or k.upper() == "BLOCKED_USER_ACTION")
+            )
+            # SUCCESS도 FAIL도 BLOCKED도 아닌 기타 status (e.g., TIMEOUT) — 실패로 간주
+            other_failures = sum(
+                int(v or 0) for k, v in status_counts.items()
+                if isinstance(k, str)
+                and k.upper() not in ("SUCCESS",)
+                and not ("BLOCKED" in k.upper())
+                and k.upper() != "FAIL"
+            )
+            total_count = int(summary_payload.get("scenario_count") or len(results_payload or []))
+            # 정확한 실패 카운트 = FAIL + BLOCKED + 기타 비성공 (정확한 회계)
+            fail_count = explicit_fail_count + blocked_count + other_failures
+            # successful_runs + failed_runs == total_count 보장 (totals 합치 정확성)
+            if success_count + fail_count < total_count:
+                # status_counts에 명시 안 된 시나리오 (e.g., 미실행) — 실패로 간주
+                fail_count = max(fail_count, total_count - success_count)
+            # final_status: 모든 시나리오가 SUCCESS여야만 "성공". 하나라도 실패/차단이면 "실패".
+            final_status = "success" if return_code == 0 and success_count == total_count and total_count > 0 else "failed"
+            if final_status == "success":
+                reason = "모든 시나리오가 성공했습니다."
+            else:
+                reason_parts = []
+                if explicit_fail_count:
+                    reason_parts.append(f"실패 {explicit_fail_count}건")
+                if blocked_count:
+                    reason_parts.append(f"차단 {blocked_count}건")
+                if other_failures:
+                    reason_parts.append(f"기타 {other_failures}건")
+                if not reason_parts and total_count == 0:
+                    reason = "실행된 시나리오가 없습니다."
+                else:
+                    reason = (
+                        "일부 시나리오가 실패했습니다 ("
+                        + ", ".join(reason_parts or ["원인 불명"])
+                        + ")."
+                    )
+
+            self.result_ready.emit(
+                {
+                    "mode": "benchmark",
+                    "status": final_status,
+                    "reason": reason,
+                    "current_goal": f"{self._site_label} 벤치",
+                    "current_step": f"{success_count}/{total_count} 성공",
+                    "blocked_reason": "",
+                    "site_key": self._site_key,
+                    "site_label": self._site_label,
+                    "target_url": self._target_url,
+                    "push_metrics": self._push_metrics,
+                    "battle_mode": battle_mode,
+                    "fast_mode": fast_mode,
+                    "battle_site_url": battle_site_url if battle_mode else "",
+                    "battle_session_id": battle_session_id if battle_mode else "",
+                    "output_dir": str(output_dir),
+                    "summary_path": str(summary_path),
+                    "results_path": str(results_path),
+                    "summary": summary_payload if isinstance(summary_payload, dict) else {},
+                    "results": results_payload if isinstance(results_payload, list) else [],
+                    "total_runs": total_count,
+                    "successful_runs": success_count,
+                    "failed_runs": fail_count,
+                    "blocked_runs": blocked_count,
+                    "proof_lines": [
+                        f"artifact: {output_dir}",
+                        f"success {success_count} / fail {explicit_fail_count} / blocked {blocked_count} / total {total_count}",
+                        *(
+                            [f"battle board: {battle_site_url}/battle/{battle_session_id}"]
+                            if battle_mode
+                            else []
+                        ),
+                    ],
+                }
+            )
+        except Exception as exc:
+            self.progress.emit(f"❌ benchmark 실행 중 오류: {exc}")
+            self.result_ready.emit(
+                {
+                    "mode": "benchmark",
+                    "status": "failed",
+                    "reason": str(exc),
+                    "current_goal": f"{self._site_label} 벤치",
+                    "current_step": "-",
+                    "blocked_reason": "",
+                    "site_key": self._site_key,
+                    "site_label": self._site_label,
+                    "target_url": self._target_url,
+                    "push_metrics": self._push_metrics,
+                    "battle_mode": bool(self._run_options.get("battle_mode")),
+                    "fast_mode": bool(self._run_options.get("fast_mode")),
+                    "output_dir": str(output_dir) if output_dir else "",
+                    "summary_path": str(output_dir / 'summary.json') if output_dir else "",
+                    "results_path": str(output_dir / 'results.json') if output_dir else "",
+                    "summary": {},
+                    "results": [],
+                    "total_runs": 0,
+                    "successful_runs": 0,
+                    "failed_runs": 0,
+                    "proof_lines": [],
+                }
+            )
+        finally:
+            self.finished.emit()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        if self._process is not None and self._process.poll() is None:
+            self._process.terminate()
+
+
+__all__ = ["GoalDrivenWorker", "ExploratoryWorker", "BenchmarkWorker"]

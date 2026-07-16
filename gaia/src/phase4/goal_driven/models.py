@@ -1,0 +1,250 @@
+"""
+Goal-Driven Test Automation Models
+
+테스트 플랜에 세부 스텝 없이 목표만 정의
+AI가 DOM을 보고 다음 액션을 스스로 결정
+"""
+
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Tuple
+from pydantic import BaseModel, Field
+from enum import Enum
+
+from gaia.src.phase4.participants.models import (
+    ContextMode,
+    ParticipantPlan,
+    ParticipantSpec,
+    TurnControl,
+    TurnPolicySpec,
+)
+
+
+class ActionType(str, Enum):
+    """가능한 액션 타입"""
+
+    CLICK = "click"
+    FILL = "fill"
+    TYPE = "type"
+    INSPECT = "inspect"
+    FOCUS = "focus"
+    PRESS = "press"
+    SCROLL = "scroll"
+    WAIT = "wait"
+    NAVIGATE = "navigate"
+    HOVER = "hover"
+    SELECT = "select"
+
+
+class TestGoal(BaseModel):
+    """
+    테스트 목표 - 세부 스텝 없음!
+
+    예시:
+    {
+        "id": "TC001",
+        "name": "로그인 성공",
+        "description": "유효한 자격 증명으로 로그인",
+        "test_data": {"email": "test@example.com", "password": "xxx"},
+        "success_criteria": ["환영 메시지", "로그아웃 버튼"],
+        "max_steps": 15
+    }
+    """
+
+    id: str = Field(..., description="테스트 ID")
+    name: str = Field(..., description="테스트 이름")
+    description: str = Field(..., description="목표 설명")
+    priority: str = Field(default="MAY", description="우선순위 (MUST/SHOULD/MAY)")
+    keywords: List[str] = Field(
+        default_factory=list, description="목표를 유도하는 핵심 키워드"
+    )
+
+    preconditions: List[str] = Field(
+        default_factory=list, description="사전 조건 (예: 로그아웃 상태)"
+    )
+
+    test_data: Dict[str, Any] = Field(
+        default_factory=dict, description="테스트에 필요한 데이터 (이메일, 비밀번호 등)"
+    )
+
+    success_criteria: List[str] = Field(
+        default_factory=list, description="성공 조건 (예: 환영 메시지 표시)"
+    )
+    expected_signals: List[str] = Field(
+        default_factory=list,
+        description="Harness/runtime contract signals expected for success",
+    )
+
+    failure_criteria: List[str] = Field(
+        default_factory=list, description="실패 조건 (예: 오류 메시지 표시)"
+    )
+
+    max_steps: int = Field(default=20, description="최대 스텝 수 (무한 루프 방지)")
+
+    start_url: Optional[str] = Field(
+        default=None, description="시작 URL (없으면 현재 페이지에서 시작)"
+    )
+
+    participants: List[ParticipantSpec] = Field(
+        default_factory=list,
+        description=(
+            "다중 참여자 정의. 비어있으면 단일 'default' 참여자 모드 (하위 호환)."
+        ),
+    )
+
+    turn_policy: Optional[TurnPolicySpec] = Field(
+        default=None,
+        description=(
+            "다중 참여자 모드의 턴 스케줄링 정책. None이면 EventDrivenScheduler 기본값."
+        ),
+    )
+
+    context_mode: ContextMode = Field(
+        default=ContextMode.ISOLATED,
+        description=(
+            "각 subagent의 LLM 컨텍스트 분리 정책 (isolated|shared_system). "
+            "단일 참여자 모드에서는 의미 없음."
+        ),
+    )
+
+
+class DOMElement(BaseModel):
+    """LLM에게 전달할 DOM 요소 (압축된 형태)"""
+
+    id: int = Field(..., description="요소 고유 ID (클릭 시 사용)")
+    tag: str = Field(..., description="HTML 태그")
+    text: str = Field(default="", description="보이는 텍스트")
+
+    # 주요 속성만 포함
+    role: Optional[str] = Field(default=None, description="ARIA role")
+    type: Optional[str] = Field(default=None, description="input type")
+    placeholder: Optional[str] = Field(default=None)
+    aria_label: Optional[str] = Field(default=None)
+    aria_modal: Optional[str] = Field(default=None)
+    title: Optional[str] = Field(default=None)
+    class_name: Optional[str] = Field(default=None)
+    href: Optional[str] = Field(default=None, description="링크 URL")
+    bounding_box: Optional[dict] = Field(default=None, description="요소 위치 정보")
+    options: Optional[list] = Field(default=None, description="select 요소의 option 목록 [{value, text}]")
+    selected_value: Optional[str] = Field(default=None, description="select 요소의 현재 선택 value")
+    container_name: Optional[str] = Field(default=None, description="가장 가까운 semantic container의 대표 이름")
+    container_role: Optional[str] = Field(default=None, description="가장 가까운 semantic container의 role")
+    container_ref_id: Optional[str] = Field(default=None, description="가장 가까운 semantic container의 synthetic ref")
+    container_source: Optional[str] = Field(default=None, description="container 선택 경로 (semantic-first/scored-fallback)")
+    context_text: Optional[str] = Field(default=None, description="해당 container의 compact 텍스트 요약")
+    group_action_labels: Optional[list] = Field(default=None, description="같은 container 안의 sibling action 라벨 목록")
+    role_ref_role: Optional[str] = Field(default=None, description="role-based recovery hint role")
+    role_ref_name: Optional[str] = Field(default=None, description="role-based recovery hint name")
+    role_ref_nth: Optional[int] = Field(default=None, description="동일 role/name 중 duplicate index")
+    context_score_hint: Optional[float] = Field(default=None, description="선택 설명용 context score")
+    ref_id: Optional[str] = Field(default=None, description="브라우저 accessibility snapshot ref ID")
+    frame_ref_id: Optional[str] = Field(default=None, description="ref가 iframe 내부일 때 iframe ref ID")
+    frame_selector: Optional[str] = Field(default=None, description="ref가 iframe 내부일 때 Playwright frame selector")
+    frame_descendant_selector: Optional[str] = Field(default=None, description="iframe 내부 대상 selector")
+    frame_scoped_selector: Optional[str] = Field(default=None, description="iframe piercing selector for action fallback")
+    scope: Optional[dict] = Field(default=None, description="브라우저/frame scope metadata")
+
+    # 상태
+    is_visible: bool = Field(default=True)
+    is_enabled: bool = Field(default=True)
+    is_focused: bool = Field(default=False)
+
+
+class ActionDecision(BaseModel):
+    """
+    LLM이 결정한 다음 액션
+
+    예시:
+    {
+        "action": "click",
+        "element_id": 5,
+        "reasoning": "로그인을 위해 먼저 로그인 탭을 선택해야 함",
+        "is_goal_achieved": false
+    }
+    """
+
+    action: ActionType = Field(..., description="수행할 액션")
+    ref_id: Optional[str] = Field(
+        default=None, description="대상 요소 ref ID (OpenClaw 경로에서 우선 사용)"
+    )
+    element_id: Optional[int] = Field(
+        default=None, description="대상 요소 ID (click, fill 등에 필요)"
+    )
+    value: Optional[str] = Field(
+        default=None, description="입력값 (fill, press 등에 필요)"
+    )
+
+    reasoning: str = Field(default="", description="이 액션을 선택한 이유")
+
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="확신도")
+
+    is_goal_achieved: bool = Field(
+        default=False, description="목표가 달성되었는지 여부"
+    )
+
+    goal_achievement_reason: Optional[str] = Field(
+        default=None, description="목표 달성 판단 이유 (is_goal_achieved=True일 때)"
+    )
+    collect_text_evidence: bool = Field(
+        default=False,
+        description="목록/카드/댓글/기사처럼 현재 화면 텍스트 evidence를 누적해야 하면 true",
+    )
+    text_evidence_reason: Optional[str] = Field(
+        default=None,
+        description="텍스트 evidence를 수집해야 한다고 판단한 이유",
+    )
+    text_evidence_focus: List[str] = Field(
+        default_factory=list,
+        description="수집해야 하는 텍스트 필드/관찰 포인트",
+    )
+    participant_id: Optional[str] = Field(
+        default=None,
+        description="다중 참여자 모드에서 이 액션을 수행할 참여자 id",
+    )
+    next_participant: Optional[str] = Field(
+        default=None,
+        description="현재 액션 이후 우선 실행할 참여자 id",
+    )
+    participant_plan: Optional[ParticipantPlan] = Field(
+        default=None,
+        description="multi_user_interaction skill이 선언한 참여자 실행 계획",
+    )
+    blackboard_event: Optional[str] = Field(
+        default=None,
+        description="액션/관찰 후 Blackboard에 게시할 명시적 이벤트 key",
+    )
+    blackboard_payload: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="blackboard_event와 함께 게시할 JSON payload",
+    )
+    turn_control: Optional[TurnControl] = Field(
+        default=None,
+        description="다중 참여자 모드에서 액션 이후 participant lifecycle 제어",
+    )
+
+
+class StepResult(BaseModel):
+    """단일 스텝 실행 결과"""
+
+    step_number: int
+    action: ActionDecision
+    success: bool
+    error_message: Optional[str] = None
+    screenshot_before: Optional[str] = None
+    screenshot_after: Optional[str] = None
+    duration_ms: int = 0
+    participant_id: Optional[str] = None
+
+
+class GoalResult(BaseModel):
+    """목표 실행 결과"""
+
+    goal_id: str
+    goal_name: str
+    success: bool
+
+    steps_taken: List[StepResult] = Field(default_factory=list)
+    total_steps: int = 0
+
+    final_reason: str = Field(default="", description="성공/실패 이유")
+
+    duration_seconds: float = 0.0

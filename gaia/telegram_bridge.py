@@ -1,0 +1,2549 @@
+"""Telegram bridge for GAIA Chat Hub."""
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional
+
+from gaia.chat_hub import HubContext, build_command_payload, dispatch_command
+from gaia.src.phase4.memory.store import MemoryStore
+
+TELEGRAM_BRIDGE_STATUS_FILE = Path.home() / ".gaia" / "telegram_bridge.status.json"
+
+
+@dataclass(slots=True)
+class TelegramConfig:
+    mode: str = "polling"
+    token_file: str = str(Path.home() / ".gaia" / "telegram_bot_token")
+    allowlist: tuple[int, ...] = ()  # admin chat_id allowlist
+    webhook_url: str = ""
+    webhook_bind: str = "127.0.0.1:8088"
+    pairing_file: str = str(Path.home() / ".gaia" / "telegram_pairing.json")
+
+
+@dataclass(slots=True)
+class _CommandEnvelope:
+    chat_id: int
+    raw_command: str
+    reply_to_message_id: int | None
+
+
+@dataclass(slots=True)
+class _PairRequest:
+    request_id: str
+    chat_id: int
+    username: str
+    full_name: str
+    created_at: int
+
+
+@dataclass(slots=True)
+class _PendingIntervention:
+    kind: str
+    question: str
+    fields: list[str]
+    event: threading.Event
+    response_text: str = ""
+    ack_text: str = "좋아요, 이어서 진행해볼게요."
+
+
+@dataclass(slots=True)
+class _ActiveRun:
+    chat_id: int
+    raw_command: str
+    started_at: float
+    current: str = ""
+    next_action: str = ""
+    completed: list[str] = field(default_factory=list)
+    last_user_note: str = ""
+    progress_events: int = 0
+
+
+class _BufferedSink:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def info(self, text: str) -> None:
+        self.lines.append(text)
+
+    def error(self, text: str) -> None:
+        self.lines.append(f"[error] {text}")
+
+
+class _PairingState:
+    def __init__(self, path: Path, configured_admins: tuple[int, ...]) -> None:
+        self.path = path
+        self.admin_ids: set[int] = set(configured_admins)
+        self.approved_ids: set[int] = set(configured_admins)
+        self.pending_by_id: dict[str, _PairRequest] = {}
+        self._load()
+
+    @staticmethod
+    def _to_int_list(values) -> list[int]:
+        out: list[int] = []
+        if not isinstance(values, list):
+            return out
+        for value in values:
+            try:
+                out.append(int(value))
+            except Exception:
+                continue
+        return out
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        self.admin_ids.update(self._to_int_list(payload.get("admins")))
+        self.approved_ids.update(self._to_int_list(payload.get("approved")))
+        self.approved_ids.update(self.admin_ids)
+
+        pending = payload.get("pending")
+        if not isinstance(pending, list):
+            return
+        for row in pending:
+            if not isinstance(row, dict):
+                continue
+            request_id = str(row.get("request_id") or "").strip()
+            if not request_id:
+                continue
+            try:
+                chat_id = int(row.get("chat_id"))
+            except Exception:
+                continue
+            req = _PairRequest(
+                request_id=request_id,
+                chat_id=chat_id,
+                username=str(row.get("username") or ""),
+                full_name=str(row.get("full_name") or ""),
+                created_at=int(row.get("created_at") or int(time.time())),
+            )
+            self.pending_by_id[request_id] = req
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "admins": sorted(self.admin_ids),
+            "approved": sorted(self.approved_ids),
+            "pending": [
+                {
+                    "request_id": req.request_id,
+                    "chat_id": req.chat_id,
+                    "username": req.username,
+                    "full_name": req.full_name,
+                    "created_at": req.created_at,
+                }
+                for req in sorted(self.pending_by_id.values(), key=lambda x: x.created_at)
+            ],
+        }
+        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def is_admin(self, chat_id: int) -> bool:
+        return chat_id in self.admin_ids
+
+    def is_approved(self, chat_id: int) -> bool:
+        return chat_id in self.approved_ids or chat_id in self.admin_ids
+
+    def ensure_bootstrap_admin(self, chat_id: int, username: str, full_name: str) -> bool:
+        if self.admin_ids:
+            return False
+        self.admin_ids.add(chat_id)
+        self.approved_ids.add(chat_id)
+        self._drop_pending_for_chat(chat_id)
+        self.save()
+        return True
+
+    def _drop_pending_for_chat(self, chat_id: int) -> None:
+        stale_ids = [req_id for req_id, req in self.pending_by_id.items() if req.chat_id == chat_id]
+        for req_id in stale_ids:
+            self.pending_by_id.pop(req_id, None)
+
+    def request_pairing(self, chat_id: int, username: str, full_name: str) -> _PairRequest:
+        for req in self.pending_by_id.values():
+            if req.chat_id == chat_id:
+                return req
+        request_id = f"r{int(time.time())}{abs(chat_id) % 10000:04d}"
+        req = _PairRequest(
+            request_id=request_id,
+            chat_id=chat_id,
+            username=username,
+            full_name=full_name,
+            created_at=int(time.time()),
+        )
+        self.pending_by_id[request_id] = req
+        self.save()
+        return req
+
+    def approve(self, request_id: str) -> _PairRequest | None:
+        req = self.pending_by_id.pop(request_id, None)
+        if req is None:
+            return None
+        self.approved_ids.add(req.chat_id)
+        self.save()
+        return req
+
+    def reject(self, request_id: str) -> _PairRequest | None:
+        req = self.pending_by_id.pop(request_id, None)
+        if req is None:
+            return None
+        self.save()
+        return req
+
+    def revoke(self, chat_id: int) -> bool:
+        if chat_id in self.admin_ids:
+            return False
+        if chat_id not in self.approved_ids:
+            return False
+        self.approved_ids.remove(chat_id)
+        self._drop_pending_for_chat(chat_id)
+        self.save()
+        return True
+
+    def pending_rows(self) -> list[_PairRequest]:
+        return sorted(self.pending_by_id.values(), key=lambda row: row.created_at)
+
+
+class _TelegramBridge:
+    def __init__(
+        self,
+        *,
+        hub_context: HubContext,
+        config: TelegramConfig,
+        memory_store: MemoryStore,
+    ):
+        self.hub_context = hub_context
+        self.config = config
+        self.memory_store = memory_store
+        self.queue: asyncio.Queue[_CommandEnvelope | None] = asyncio.Queue()
+        self.worker_task: Optional[asyncio.Task] = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pending_interventions: dict[int, _PendingIntervention] = {}
+        self._pending_lock = threading.Lock()
+        self._active_runs: dict[int, _ActiveRun] = {}
+        self._queued_count_by_chat: dict[int, int] = {}
+        self._tracking_enabled: set[int] = set()
+        self._tracking_last_signature: dict[int, str] = {}
+        self._live_interventions: dict[int, Dict[str, Any]] = {}
+        self._state_lock = threading.Lock()
+        self._chatbot_client: Any | None = None
+        self._chatbot_client_key: tuple[str, str] = ("", "")
+        self.pairing = _PairingState(
+            path=Path(config.pairing_file),
+            configured_admins=config.allowlist,
+        )
+
+    async def post_init(self, _application) -> None:
+        self.loop = asyncio.get_running_loop()
+        self._write_status("running")
+        self.worker_task = asyncio.create_task(self._worker_loop(_application))
+
+    async def post_shutdown(self, _application) -> None:
+        await self.queue.put(None)
+        if self.worker_task:
+            await self.worker_task
+        self._write_status("stopped")
+
+    def _write_status(self, state: str) -> None:
+        try:
+            TELEGRAM_BRIDGE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TELEGRAM_BRIDGE_STATUS_FILE.write_text(
+                json.dumps(
+                    {
+                        "state": str(state or "").strip() or "unknown",
+                        "updated_at": int(time.time()),
+                        "mode": self.config.mode,
+                        "url": self.hub_context.url,
+                        "runtime": self.hub_context.runtime,
+                        "control_channel": self.hub_context.control_channel,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _allowed(self, chat_id: int) -> bool:
+        return self.pairing.is_approved(chat_id)
+
+    async def _send_text(self, bot, chat_id: int, text: str, reply_to_message_id: int | None) -> None:
+        chunks = _split_text(text, limit=3900)
+        for chunk in chunks:
+            kwargs = {"chat_id": chat_id, "text": chunk}
+            if reply_to_message_id is not None:
+                kwargs["reply_to_message_id"] = reply_to_message_id
+            await bot.send_message(**kwargs)
+
+    async def _safe_reply_text(self, message, text: str) -> bool:
+        try:
+            await message.reply_text(text)
+            return True
+        except Exception as exc:
+            print(f"[telegram/bridge] reply_text failed: {type(exc).__name__}: {exc}")
+            return False
+
+    async def handle_error(self, _update, context) -> None:
+        err = getattr(context, "error", None)
+        if err is None:
+            print("[telegram/bridge] handler error: unknown")
+            return
+        print(f"[telegram/bridge] handler error: {type(err).__name__}: {err}")
+
+    async def _send_attachments(
+        self,
+        bot,
+        chat_id: int,
+        attachments: list[dict],
+        reply_to_message_id: int | None,
+    ) -> None:
+        if not attachments:
+            return
+        max_images = 3
+        try:
+            max_images = max(1, min(10, int(os.getenv("GAIA_TG_MAX_IMAGES_PER_RUN", "3"))))
+        except Exception:
+            max_images = 3
+        photo_items: list[tuple[io.BytesIO, str]] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            kind = str(attachment.get("kind") or "").strip().lower()
+            if kind != "image_base64":
+                continue
+            encoded = attachment.get("data")
+            if not isinstance(encoded, str) or not encoded.strip():
+                continue
+            try:
+                binary = base64.b64decode(encoded)
+            except Exception:
+                continue
+            photo = io.BytesIO(binary)
+            photo.name = "gaia_result.png"
+            caption = str(attachment.get("caption") or attachment.get("label") or "").strip()
+            photo_items.append((photo, caption))
+            if len(photo_items) >= max_images:
+                break
+
+        if not photo_items:
+            return
+
+        # Telegram media-group limit: up to 10 items.
+        # Prefer grouped delivery for better mobile readability.
+        async def _send_group(items: list[tuple[io.BytesIO, str]], is_first_group: bool) -> None:
+            try:
+                from telegram import InputMediaPhoto  # type: ignore
+
+                media = []
+                for idx, (photo, caption) in enumerate(items):
+                    cap = caption if idx == 0 else ""
+                    media.append(InputMediaPhoto(media=photo, caption=cap or None))
+                kwargs: Dict[str, Any] = {"chat_id": chat_id, "media": media}
+                if reply_to_message_id is not None and is_first_group:
+                    kwargs["reply_to_message_id"] = reply_to_message_id
+                await bot.send_media_group(**kwargs)
+            except Exception:
+                # Fallback: sequential photo sends.
+                for idx, (photo, caption) in enumerate(items):
+                    kwargs: Dict[str, Any] = {"chat_id": chat_id, "photo": photo}
+                    if caption:
+                        kwargs["caption"] = caption
+                    if reply_to_message_id is not None and is_first_group and idx == 0:
+                        kwargs["reply_to_message_id"] = reply_to_message_id
+                    await bot.send_photo(**kwargs)
+
+        for start in range(0, len(photo_items), 10):
+            group = photo_items[start : start + 10]
+            await _send_group(group, is_first_group=(start == 0))
+
+    @staticmethod
+    def _sanitize_payload_for_text(payload_obj: Dict[str, Any]) -> Dict[str, Any]:
+        safe: Dict[str, Any] = dict(payload_obj or {})
+        attachments = safe.get("attachments")
+        if not isinstance(attachments, list):
+            return safe
+
+        sanitized_attachments: list[Dict[str, Any]] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            item: Dict[str, Any] = {}
+            for key, value in attachment.items():
+                if key == "data":
+                    continue
+                item[key] = value
+            encoded = attachment.get("data")
+            if isinstance(encoded, str) and encoded:
+                item["data_bytes"] = len(encoded)
+            sanitized_attachments.append(item)
+        safe["attachments"] = sanitized_attachments
+        return safe
+
+    @staticmethod
+    def _format_reason_code_summary(summary: Any) -> str:
+        if not isinstance(summary, dict) or not summary:
+            return "-"
+        parts: list[str] = []
+        for key, value in summary.items():
+            try:
+                count = int(value)
+            except Exception:
+                count = 0
+            name = str(key or "").strip()
+            if not name:
+                continue
+            parts.append(f"{name}={count}")
+        return ", ".join(parts) if parts else "-"
+
+    @staticmethod
+    def _truncate(value: Any, limit: int = 120) -> str:
+        text = str(value if value is not None else "").replace("\n", " ").strip()
+        if not text:
+            return "-"
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    @staticmethod
+    def _resolve_report_mode() -> str:
+        mode = str(os.getenv("GAIA_TG_REPORT_MODE", "summary_with_json") or "").strip().lower()
+        if mode in {"summary_with_json", "summary_only", "legacy_json_text"}:
+            return mode
+        return "summary_with_json"
+
+    @staticmethod
+    def _status_label_ko(status: Any) -> str:
+        token = str(status or "").strip().lower()
+        if token in {"blocked_user_action", "blocked"}:
+            return "사용자 개입 필요"
+        if token in {"skipped_not_applicable", "skipped"}:
+            return "적용 불가"
+        if token in {"ok", "success"}:
+            return "성공"
+        if token in {"failed", "error"}:
+            return "실패"
+        if token == "empty":
+            return "결과 없음"
+        if token == "exit":
+            return "종료"
+        return token or "-"
+
+    async def _send_json_report(
+        self,
+        bot,
+        chat_id: int,
+        payload_obj: Dict[str, Any],
+        reply_to_message_id: int | None,
+    ) -> bool:
+        try:
+            compact_payload = self._build_compact_report_payload(payload_obj)
+            blob = json.dumps(compact_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            doc = io.BytesIO(blob)
+            doc.name = f"report_{int(time.time())}.json"
+            kwargs: Dict[str, Any] = {
+                "chat_id": chat_id,
+                "document": doc,
+                "caption": "상세 실행 결과(JSON)",
+            }
+            if reply_to_message_id is not None:
+                kwargs["reply_to_message_id"] = reply_to_message_id
+            await bot.send_document(**kwargs)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _compact_validation_checks(rows: Any, limit: int = 50) -> list[Dict[str, Any]]:
+        if not isinstance(rows, list):
+            return []
+        compact: list[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            compact.append(
+                {
+                    "check_id": row.get("check_id"),
+                    "step": row.get("step"),
+                    "status": row.get("status"),
+                    "name": row.get("name"),
+                    "action": row.get("action"),
+                    "input_value": row.get("input_value"),
+                    "error": row.get("error") or "",
+                }
+            )
+            if len(compact) >= limit:
+                break
+        return compact
+
+    @staticmethod
+    def _compact_step_timeline(rows: Any, limit: int = 12) -> list[Dict[str, Any]]:
+        if not isinstance(rows, list):
+            return []
+        compact: list[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            compact.append(
+                {
+                    "step": row.get("step"),
+                    "action": row.get("action"),
+                    "duration_seconds": row.get("duration_seconds"),
+                    "success": row.get("success"),
+                    "reasoning": row.get("reasoning") or "",
+                    "error": row.get("error") or "",
+                }
+            )
+            if len(compact) >= limit:
+                break
+        return compact
+
+    @staticmethod
+    def _compact_adaptive_qa_rows(rows: Any, limit: int = 50) -> list[Dict[str, Any]]:
+        if not isinstance(rows, list):
+            return []
+        compact: list[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            compact.append(
+                {
+                    "id": row.get("id"),
+                    "name": row.get("name") or row.get("title"),
+                    "title": row.get("title") or row.get("name"),
+                    "status": row.get("status"),
+                    "reason": row.get("reason") or row.get("evidence") or "",
+                    "steps": row.get("steps"),
+                }
+            )
+            if len(compact) >= limit:
+                break
+        return compact
+
+    @classmethod
+    def _compact_adaptive_qa_report(cls, report: Any, limit: int = 50) -> Dict[str, Any]:
+        if not isinstance(report, dict):
+            return {}
+        summary = report.get("summary")
+        checks = cls._compact_adaptive_qa_rows(report.get("checks"), limit=limit)
+        edge_results = cls._compact_adaptive_qa_rows(report.get("edge_results"), limit=limit)
+        failed_edge_results = [
+            row
+            for row in edge_results
+            if str(row.get("status") or "").strip().lower() in {"fail", "failed", "error"}
+        ]
+        skipped_edge_results = [
+            row
+            for row in edge_results
+            if str(row.get("status") or "").strip().lower() in {"skip", "skipped", "not_applicable"}
+        ]
+        unsupported_edge_results = [
+            row
+            for row in edge_results
+            if str(row.get("status") or "").strip().lower() in {"unsupported", "blocked_unsupported"}
+        ]
+        return {
+            "mode": report.get("mode"),
+            "summary": summary if isinstance(summary, dict) else {},
+            "checks": checks,
+            "edge_results": edge_results,
+            "failed_edge_results": failed_edge_results,
+            "skipped_edge_results": skipped_edge_results,
+            "unsupported_edge_results": unsupported_edge_results,
+        }
+
+    @classmethod
+    def _build_compact_report_payload(cls, payload_obj: Dict[str, Any]) -> Dict[str, Any]:
+        payload = payload_obj if isinstance(payload_obj, dict) else {}
+        validation_summary = payload.get("validation_summary")
+        validation_rail_summary = payload.get("validation_rail_summary")
+        validation_rail_cases = payload.get("validation_rail_cases")
+        adaptive_qa_report = cls._compact_adaptive_qa_report(payload.get("adaptive_qa_report"))
+        checks = cls._compact_validation_checks(payload.get("validation_checks"), limit=50)
+        step_timeline = cls._compact_step_timeline(payload.get("step_timeline"), limit=20)
+        reason_codes = payload.get("reason_code_summary")
+        attachments = payload.get("attachments")
+
+        compact: Dict[str, Any] = {
+            "schema_version": "gaia.telegram.report.v1",
+            "generated_at": int(time.time()),
+            "result": {
+                "status": payload.get("status"),
+                "final_status": payload.get("final_status"),
+                "goal": payload.get("goal") or payload.get("command"),
+                "steps": payload.get("steps"),
+                "duration": payload.get("duration"),
+                "reason": payload.get("reason"),
+                "exit_code": payload.get("exit_code"),
+            },
+            "timeline": {
+                "steps": step_timeline,
+            },
+            "validation": {
+                "summary": validation_summary if isinstance(validation_summary, dict) else {},
+                "checks": checks,
+            },
+            "validation_rail": {
+                "summary": (
+                    validation_rail_summary
+                    if isinstance(validation_rail_summary, dict)
+                    else {}
+                ),
+                "cases": (
+                    validation_rail_cases[:50]
+                    if isinstance(validation_rail_cases, list)
+                    else []
+                ),
+            },
+            "adaptive_qa": adaptive_qa_report,
+            "diagnostics": {
+                "reason_code_summary": reason_codes if isinstance(reason_codes, dict) else {},
+                "url": payload.get("url"),
+                "runtime": payload.get("runtime"),
+            },
+            "artifacts": {
+                "attachments": attachments if isinstance(attachments, list) else [],
+            },
+        }
+
+        # 실패 시 핵심 실패 체크만 추가 제공
+        if str(payload.get("status") or "").strip().lower() in {"failed", "error"}:
+            failed_checks = [row for row in checks if str(row.get("status") or "").strip().lower() == "failed"]
+            compact["diagnostics"]["failed_checks"] = failed_checks[:10]
+
+        return compact
+
+    @classmethod
+    def _format_adaptive_qa_lines(cls, report: Any) -> list[str]:
+        if not isinstance(report, dict) or not report:
+            return []
+        summary = report.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
+        edge_results = report.get("edge_results")
+        edge_results = edge_results if isinstance(edge_results, list) else []
+
+        def _int_value(value: Any, fallback: int = 0) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return fallback
+
+        generated = _int_value(summary.get("generated_edge_case_count"), len(edge_results))
+        executed = _int_value(summary.get("executed_edge_case_count"), len(edge_results))
+        passed = _int_value(
+            summary.get("passed_edge_case_count"),
+            sum(1 for row in edge_results if str((row or {}).get("status") or "").lower() == "pass"),
+        )
+        failed = _int_value(
+            summary.get("failed_edge_case_count"),
+            sum(1 for row in edge_results if str((row or {}).get("status") or "").lower() == "fail"),
+        )
+        skipped = _int_value(
+            summary.get("skipped_edge_case_count"),
+            sum(1 for row in edge_results if str((row or {}).get("status") or "").lower() == "skip"),
+        )
+        unsupported = _int_value(
+            summary.get("unsupported_edge_case_count"),
+            sum(1 for row in edge_results if str((row or {}).get("status") or "").lower() == "unsupported"),
+        )
+        score = summary.get("score")
+        score_text = "-"
+        try:
+            score_text = f"{float(score) * 100:.1f}%"
+        except Exception:
+            pass
+        mode = cls._truncate(report.get("mode"), 40)
+        lines = [
+            "",
+            "  Deep QA 확장 결과",
+            f"    - 모드 {mode}",
+            f"    - 생성 {generated}건 / 실행 {executed}건",
+            f"    - 성공 {passed}건 / 실패 {failed}건",
+            f"    - 스킵 {skipped}건 / 미지원 {unsupported}건",
+            f"    - 점수 {score_text}",
+        ]
+        failed_edges = [
+            row for row in edge_results
+            if isinstance(row, dict)
+            and str(row.get("status") or "").strip().lower() in {"fail", "failed", "error", "unsupported"}
+        ][:5]
+        if failed_edges:
+            lines.append("    - 실패 케이스")
+            for row in failed_edges:
+                title = cls._truncate(row.get("name") or row.get("title") or row.get("id"), 72)
+                reason = cls._truncate(row.get("reason") or row.get("evidence"), 90)
+                lines.append(f"      · {title}")
+                if reason != "-":
+                    lines.append(f"        {reason}")
+        return lines
+
+    @classmethod
+    def _format_payload_text(cls, payload: Dict[str, Any], *, mode: str = "summary_with_json") -> str:
+        if not isinstance(payload, dict):
+            return ""
+        goal = cls._truncate(payload.get("goal") or payload.get("command"), 130)
+        reason = cls._truncate(payload.get("reason"), 180)
+        status_label = cls._status_label_ko(payload.get("final_status") or payload.get("status"))
+
+        steps = payload.get("steps")
+        steps_text = f"{steps}단계" if steps is not None else "-"
+        duration = payload.get("duration")
+        if duration is None:
+            duration_text = "-"
+        else:
+            try:
+                duration_text = f"{float(duration):.2f}초"
+            except Exception:
+                duration_text = f"{duration}초"
+
+        lines: list[str] = [
+            f"🔥실행 결과 {status_label}🔥",
+            "",
+            f"  목표: {goal}",
+            "",
+            "  단계/시간",
+            f"  {steps_text} / {duration_text}",
+            "",
+            "  판정 사유",
+            f"  {reason}",
+        ]
+
+        step_timeline = payload.get("step_timeline")
+        if isinstance(step_timeline, list) and step_timeline:
+            lines.extend(["", "  단계별 실행"])
+            for row in step_timeline[:6]:
+                if not isinstance(row, dict):
+                    continue
+                step_no = row.get("step")
+                action = cls._truncate(row.get("action"), 20)
+                try:
+                    sec = float(row.get("duration_seconds") or 0.0)
+                    sec_text = f"{sec:.2f}초"
+                except Exception:
+                    sec_text = "-"
+                reasoning = cls._truncate(row.get("reasoning"), 90)
+                lines.append(f"    - {step_no}단계 | {action} | {sec_text}")
+                lines.append(f"      {reasoning}")
+
+        attachments = payload.get("attachments")
+        proof_labels: list[str] = []
+        if isinstance(attachments, list):
+            for item in attachments:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("kind") or "").strip().lower() != "image_base64":
+                    continue
+                label = cls._truncate(item.get("label") or item.get("caption"), 60)
+                if label == "-":
+                    label = "대표 실행 화면"
+                proof_labels.append(label)
+        if proof_labels:
+            lines.extend(["", "  대표 증빙"])
+            lines.append(f"    - 이미지 {len(proof_labels)}건 첨부")
+            for label in proof_labels[:3]:
+                lines.append(f"    - {label}")
+
+        validation_summary = payload.get("validation_summary")
+        if isinstance(validation_summary, dict) and validation_summary:
+            total = validation_summary.get("total_checks", 0)
+            passed = validation_summary.get("passed_checks", 0)
+            failed = validation_summary.get("failed_checks", 0)
+            success_rate = validation_summary.get("success_rate", 0)
+            goal_satisfied = validation_summary.get("goal_satisfied")
+            lines.extend(
+                [
+                    "",
+                    "  검증 요약",
+                    f"    - 총 {total}건",
+                    f"    - 성공 {passed}건",
+                    f"    - 실패 {failed}건",
+                    f"    - 성공률 {success_rate}%",
+                ]
+            )
+            if goal_satisfied is not None:
+                lines.append(f"    - 목표 충족 {'예' if bool(goal_satisfied) else '아니오'}")
+        rail_summary = payload.get("validation_rail_summary")
+        if isinstance(rail_summary, dict) and rail_summary:
+            lines.extend(
+                [
+                    "",
+                    "  검증 레일",
+                    f"    - 범위 {rail_summary.get('scope', '-')}",
+                    f"    - 모드 {rail_summary.get('mode', '-')}",
+                    f"    - 상태 {rail_summary.get('status', '-')}",
+                    f"    - 통과 {rail_summary.get('passed', 0)}건",
+                    f"    - 실패 {rail_summary.get('failed', 0)}건",
+                    f"    - 스킵 {rail_summary.get('skipped', 0)}건",
+                ]
+            )
+            failed_cases = payload.get("validation_rail_cases")
+            if isinstance(failed_cases, list) and failed_cases:
+                top_failed = [
+                    row for row in failed_cases
+                    if isinstance(row, dict) and str(row.get("status") or "").strip().lower() in {"failed", "timedout", "timeout", "error"}
+                ][:3]
+                if top_failed:
+                    lines.append("    - 실패 케이스 상위 3개")
+                    for row in top_failed:
+                        lines.append(f"      · {cls._truncate(row.get('title') or row.get('id'), 80)}")
+        lines.extend(cls._format_adaptive_qa_lines(payload.get("adaptive_qa_report")))
+        if mode == "summary_with_json":
+            lines.extend(
+                [
+                    "",
+                    "  상세 결과",
+                    "    - 첨부된 report.json 확인",
+                ]
+            )
+        elif mode == "summary_only":
+            lines.extend(
+                [
+                    "",
+                    "  상세 결과",
+                    "    - 요약 모드(첨부 없음)",
+                ]
+            )
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _parse_kv(text: str) -> Dict[str, str]:
+        aliases = {
+            "id": "username",
+            "user": "username",
+            "username": "username",
+            "email": "email",
+            "pw": "password",
+            "password": "password",
+            "goal": "goal_text",
+            "goal_text": "goal_text",
+        }
+        out: Dict[str, str] = {}
+        for token in (text or "").split():
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            key = aliases.get(key.strip().lower(), key.strip().lower())
+            value = value.strip().strip('"').strip("'")
+            if value:
+                out[key] = value
+        return out
+
+    @staticmethod
+    def _parse_intervention_response(
+        kind: str,
+        text: str,
+        fields: list[str] | None = None,
+    ) -> Dict[str, Any]:
+        raw = (text or "").strip()
+        low = raw.lower()
+        if low in {"cancel", "/cancel", "n", "no", "취소"}:
+            return {"action": "cancel", "proceed": False}
+
+        kv = _TelegramBridge._parse_kv(raw)
+        requested_fields = [str(field or "").strip() for field in (fields or []) if str(field or "").strip()]
+        if kind == "auth":
+            if low in {"manual", "manual_done", "done", "수동완료"}:
+                return {"manual_done": True, "proceed": True}
+            wants_signup = any(
+                token in low for token in ("회원가입", "signup", "sign up", "register")
+            )
+            asks_credentials = (
+                ("아이디" in raw and "비밀번호" in raw and ("알려" in raw or "공유" in raw))
+                or "credential" in low
+            )
+
+            def _clean(v: str) -> str:
+                return v.strip().strip('"').strip("'").strip(".,!?")
+
+            # 자유형 문장에서 부가 필드 추출
+            dept = ""
+            year = ""
+            m_dept = re.search(r"(?:학과|과)\s*(?:는|은|:)?\s*([^\s,.!?]+)", raw)
+            if m_dept:
+                dept = _clean(m_dept.group(1))
+            m_year = re.search(r"([1-6])\s*학년", raw)
+            if m_year:
+                year = _clean(m_year.group(1))
+
+            # 자유형 아이디/비밀번호 추출
+            if "username" not in kv and "email" not in kv:
+                m_id = re.search(r"(?:아이디|id|username)\s*(?:는|은|:)?\s*([^\s,]+)", raw, re.IGNORECASE)
+                m_email = re.search(r"(?:이메일|email)\s*(?:는|은|:)?\s*([^\s,]+)", raw, re.IGNORECASE)
+                if m_id:
+                    kv["username"] = _clean(m_id.group(1))
+                if m_email:
+                    kv["email"] = _clean(m_email.group(1))
+            if "password" not in kv:
+                m_pw = re.search(r"(?:비밀번호|패스워드|password|pw)\s*(?:는|은|:)?\s*([^\s,]+)", raw, re.IGNORECASE)
+                if m_pw:
+                    kv["password"] = _clean(m_pw.group(1))
+
+            if wants_signup:
+                resp: Dict[str, Any] = {"auth_mode": "signup", "proceed": True}
+                resp.update(kv)
+                if dept:
+                    resp["department"] = dept
+                if year:
+                    resp["grade_year"] = year
+                if asks_credentials:
+                    resp["return_credentials"] = True
+                return resp
+
+            if kv:
+                if "username" in kv or "email" in kv:
+                    kv.setdefault("proceed", "true")
+                    return kv
+                return {"action": "cancel", "proceed": False}
+            return {"action": "cancel", "proceed": False}
+
+        if kind in {"human_answer", "input"}:
+            if kv:
+                kv.setdefault("action", "continue")
+                kv.setdefault("proceed", "true")
+                return kv
+            fillable_fields = [
+                field
+                for field in requested_fields
+                if field not in {"proceed", "manual_done", "instruction", "auth_mode", "return_credentials"}
+            ]
+            if raw and len(fillable_fields) == 1:
+                return {
+                    "action": "continue",
+                    "proceed": "true",
+                    fillable_fields[0]: raw,
+                }
+            if raw:
+                return {
+                    "action": "continue",
+                    "proceed": "true",
+                    "instruction": raw,
+                }
+            return {"action": "cancel", "proceed": False}
+
+        if kind == "clarification":
+            if not kv and raw:
+                return {"goal_text": raw, "proceed": True}
+            if kv:
+                kv.setdefault("proceed", "true")
+                return kv
+            return {"action": "cancel", "proceed": False}
+
+        if kind == "no_progress":
+            if not kv and raw:
+                return {"instruction": raw, "proceed": True}
+            if kv:
+                kv.setdefault("proceed", "true")
+                return kv
+            return {"action": "continue", "proceed": True}
+
+        return {"action": "cancel", "proceed": False}
+
+    @staticmethod
+    def _fallback_intervention_message(kind: str, question: str, fields: list[str]) -> str:
+        def _has_field(name: str) -> bool:
+            return any(str(field or "").strip().lower() == name for field in fields)
+
+        helper_lines = []
+        if kind == "auth":
+            first_field = "이메일" if _has_field("email") and not _has_field("username") else "아이디"
+            helper_lines.append(f"로그인을 이어가려면 {first_field}를 먼저 보내주세요.")
+            if _has_field("auth_mode"):
+                helper_lines.append("회원가입으로 진행하려면: auth_mode=signup")
+        elif kind in {"human_answer", "input"}:
+            requested_fields = [
+                str(v).strip()
+                for v in fields
+                if str(v).strip()
+                and str(v).strip().lower()
+                not in {"action", "proceed", "manual_done", "instruction", "auth_mode", "return_credentials"}
+            ]
+            requested_set = {field.lower() for field in requested_fields}
+            if "password" in requested_set and ("username" in requested_set or "email" in requested_set):
+                first_field = "이메일" if "email" in requested_set and "username" not in requested_set else "아이디"
+                helper_lines.append(f"로그인을 이어가려면 {first_field}를 먼저 보내주세요.")
+            elif requested_fields:
+                helper_lines.append("필요한 값을 한 줄로 보내주세요.")
+            else:
+                helper_lines.append("원하는 처리 방향을 문장으로 답장해 주세요.")
+        elif kind == "clarification":
+            helper_lines.append("목표를 조금 더 구체적으로 보내주세요.")
+            helper_lines.append("예: 11주차 특강 영상을 재생해줘")
+        helper_lines.append("중단하려면 /cancel")
+        return "\n".join([question, *helper_lines]).strip()
+
+    @staticmethod
+    def _compact_goal_context(payload: Mapping[str, Any] | None, question: str = "") -> str:
+        source = payload if isinstance(payload, Mapping) else {}
+        candidates = (
+            source.get("goal_description"),
+            source.get("goal_name"),
+            source.get("reason"),
+            question,
+        )
+        for candidate in candidates:
+            text = re.sub(r"\s+", " ", str(candidate or "")).strip()
+            if not text:
+                continue
+            return text[:90] + ("…" if len(text) > 90 else "")
+        return ""
+
+    @classmethod
+    def _fallback_login_credentials_message(
+        cls,
+        *,
+        payload: Mapping[str, Any] | None,
+        question: str,
+        username_label: str,
+        stage: str,
+    ) -> str:
+        context = cls._compact_goal_context(payload, question)
+        if stage == "password":
+            lines = [
+                f"{username_label} 받았어요.",
+                "이제 비밀번호만 보내주시면 로그인 후 바로 이어서 진행할게요.",
+                "중단하려면 /cancel",
+            ]
+        else:
+            lines = [
+                "좋아요, 제가 이어서 진행해볼게요.",
+                (
+                    f"{context} 작업을 계속하려면 로그인이 필요해요."
+                    if context
+                    else "현재 화면에서 로그인이 필요해요."
+                ),
+                f"{username_label}만 먼저 보내주세요. 비밀번호는 다음 메시지에서 따로 받을게요.",
+                "중단하려면 /cancel",
+            ]
+        return "\n".join(line for line in lines if line).strip()
+
+    @classmethod
+    def _compose_login_credentials_message(
+        cls,
+        *,
+        payload: Mapping[str, Any] | None,
+        question: str,
+        username_label: str,
+        stage: str,
+    ) -> str:
+        fallback = cls._fallback_login_credentials_message(
+            payload=payload,
+            question=question,
+            username_label=username_label,
+            stage=stage,
+        )
+        if os.getenv("GAIA_TELEGRAM_LLM_INTERVENTION_MESSAGE", "1").strip().lower() in {"0", "false", "off", "no"}:
+            return fallback
+        try:
+            from gaia import chat_hub
+
+            client = chat_hub._get_chat_router_client()
+            if client is None or not hasattr(client, "analyze_text"):
+                return fallback
+            safe_payload = {
+                "stage": stage,
+                "username_label": username_label,
+                "question": question,
+                "goal_context": cls._compact_goal_context(payload, question),
+                "kind": str((payload or {}).get("kind") or "").strip(),
+                "reason_code": str((payload or {}).get("reason_code") or "").strip(),
+            }
+            prompt = (
+                "당신은 GAIA Telegram 봇의 로그인 도움말 메시지를 작성합니다.\n"
+                "사용자는 자연스럽게 답장하고 싶어합니다. 한국어로 짧고 친근하게 쓰세요.\n"
+                "반드시 JSON만 출력하세요: {\"message\":\"...\"}\n\n"
+                "작성 규칙:\n"
+                "- 지금 필요한 값 하나만 요청합니다.\n"
+                "- 내부 필드명(username, password, proceed, manual_done)은 쓰지 않습니다.\n"
+                "- 아이디 단계에서는 비밀번호를 한꺼번에 요구하지 말고 다음 메시지에서 받는다고 안내합니다.\n"
+                "- 비밀번호 단계에서는 받은 아이디 값을 반복하거나 노출하지 않습니다.\n"
+                "- /cancel 안내는 마지막 줄에 포함합니다.\n"
+                "- 500자 이하로 작성합니다.\n\n"
+                f"요청 payload:\n{json.dumps(safe_payload, ensure_ascii=False, indent=2)}"
+            )
+            response = client.analyze_text(prompt, max_completion_tokens=500, temperature=0.25)
+            data = json.loads(chat_hub._extract_json_object(str(response)))
+            message = str(data.get("message") or "").strip() if isinstance(data, dict) else ""
+            if message:
+                return message[:1200]
+        except Exception:
+            return fallback
+        return fallback
+
+    @staticmethod
+    def _sequential_login_field(fields: list[str]) -> str:
+        normalized = {str(field or "").strip().lower() for field in fields}
+        if "email" in normalized and "username" not in normalized:
+            return "email"
+        return "username"
+
+    @staticmethod
+    def _should_collect_login_credentials(kind: str, fields: list[str]) -> bool:
+        if kind not in {"auth", "human_answer", "input"}:
+            return False
+        normalized = {str(field or "").strip().lower() for field in fields}
+        return "password" in normalized and ("username" in normalized or "email" in normalized)
+
+    @staticmethod
+    def _compose_intervention_message(payload: Dict[str, Any], fields: list[str]) -> str:
+        kind = str(payload.get("kind") or "input").strip().lower()
+        question = str(payload.get("question") or "추가 입력이 필요합니다.").strip()
+        fallback = _TelegramBridge._fallback_intervention_message(kind, question, fields)
+        if os.getenv("GAIA_TELEGRAM_LLM_INTERVENTION_MESSAGE", "1").strip().lower() in {"0", "false", "off", "no"}:
+            return fallback
+        try:
+            from gaia import chat_hub
+
+            client = chat_hub._get_chat_router_client()
+            if client is None or not hasattr(client, "analyze_text"):
+                return fallback
+            safe_payload = {
+                "kind": kind,
+                "question": question,
+                "fields": [str(v) for v in fields if str(v).strip()],
+                "goal_name": str(payload.get("goal_name") or "").strip(),
+                "goal_description": str(payload.get("goal_description") or "").strip(),
+                "reason_code": str(payload.get("reason_code") or "").strip(),
+            }
+            prompt = (
+                "당신은 GAIA Telegram 봇의 사용자 개입 안내문을 작성합니다.\n"
+                "사용자가 지금 답장해야 실행이 계속됩니다. 한국어로 자연스럽고 짧게 쓰세요.\n"
+                "반드시 JSON만 출력하세요: {\"message\":\"...\"}\n\n"
+                "작성 규칙:\n"
+                "- 현재 요청 kind/question/fields를 보고 필요한 정보만 요청합니다.\n"
+                "- 사용자가 자연스럽게 답장할 수 있도록 한 번에 하나씩 요청합니다.\n"
+                "- 로그인 정보는 예시를 들지 말고 '아이디를 먼저 보내주세요'처럼 안내합니다.\n"
+                "- proceed, action 같은 내부 제어 필드는 사용자에게 쓰라고 안내하지 않습니다.\n"
+                "- username/password, manual_done, instruction 같은 필드명은 꼭 필요한 경우가 아니면 사용자에게 노출하지 않습니다.\n"
+                "- password, otp, token 같은 민감값은 실제 값을 추측하거나 예시 값으로 길게 만들지 말고 <pw>, <otp>처럼 표기합니다.\n"
+                "- 취소 방법 /cancel은 마지막에 한 줄로 포함합니다.\n"
+                "- Telegram 메시지이므로 900자 이하, 마크다운 표 없이 작성합니다.\n\n"
+                f"요청 payload:\n{json.dumps(safe_payload, ensure_ascii=False, indent=2)}"
+            )
+            response = client.analyze_text(prompt, max_completion_tokens=700, temperature=0.2)
+            data = json.loads(chat_hub._extract_json_object(str(response)))
+            message = str(data.get("message") or "").strip() if isinstance(data, dict) else ""
+            if message:
+                return message[:1800]
+        except Exception:
+            return fallback
+        return fallback
+
+    def _wait_for_intervention_text(
+        self,
+        application,
+        chat_id: int,
+        reply_to_message_id: int | None,
+        *,
+        kind: str,
+        question: str,
+        fields: list[str],
+        prompt: str,
+        attachments: list[dict] | None = None,
+        timeout: int = 600,
+        ack_text: str = "",
+    ) -> tuple[str, str]:
+        loop = self.loop
+        if loop is None:
+            return ("cancel", "")
+
+        pending = _PendingIntervention(
+            kind=kind,
+            question=question,
+            fields=fields,
+            event=threading.Event(),
+            ack_text=ack_text,
+        )
+        with self._pending_lock:
+            self._pending_interventions[chat_id] = pending
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._send_text(application.bot, chat_id, prompt, reply_to_message_id),
+                loop,
+            )
+            fut.result(timeout=15)
+            if attachments:
+                fut_attach = asyncio.run_coroutine_threadsafe(
+                    self._send_attachments(
+                        application.bot,
+                        chat_id,
+                        attachments[:1],
+                        reply_to_message_id,
+                    ),
+                    loop,
+                )
+                fut_attach.result(timeout=15)
+        except Exception:
+            with self._pending_lock:
+                if self._pending_interventions.get(chat_id) is pending:
+                    self._pending_interventions.pop(chat_id, None)
+            return ("cancel", "")
+
+        waited = pending.event.wait(timeout=timeout)
+        with self._pending_lock:
+            if self._pending_interventions.get(chat_id) is pending:
+                self._pending_interventions.pop(chat_id, None)
+        if not waited:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_text(
+                        application.bot,
+                        chat_id,
+                        "입력 대기 시간(10분) 초과로 실행을 취소했습니다.",
+                        reply_to_message_id,
+                    ),
+                    loop,
+                )
+            except Exception:
+                pass
+            return ("timeout", "")
+
+        response_text = str(pending.response_text or "").strip()
+        if response_text.lower() in {"cancel", "/cancel", "취소"}:
+            return ("cancel", "")
+        return ("ok", response_text)
+
+    def _collect_login_credentials(
+        self,
+        application,
+        chat_id: int,
+        reply_to_message_id: int | None,
+        *,
+        kind: str,
+        question: str,
+        fields: list[str],
+        attachments: list[dict],
+        payload: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        username_field = self._sequential_login_field(fields)
+        username_label = "이메일" if username_field == "email" else "아이디"
+
+        status, first_text = self._wait_for_intervention_text(
+            application,
+            chat_id,
+            reply_to_message_id,
+            kind=kind,
+            question=question,
+            fields=[username_field],
+            prompt=self._compose_login_credentials_message(
+                payload=payload,
+                question=question,
+                username_label=username_label,
+                stage="username",
+            ),
+            attachments=attachments,
+        )
+        if status != "ok":
+            return {"action": "cancel", "proceed": False}
+
+        first_kv = self._parse_kv(first_text)
+        username_value = first_kv.get(username_field) or first_kv.get("username") or first_kv.get("email") or first_text
+        password_value = first_kv.get("password")
+        if password_value:
+            return {
+                "action": "continue",
+                "proceed": "true",
+                username_field: username_value,
+                "password": password_value,
+            }
+
+        status, second_text = self._wait_for_intervention_text(
+            application,
+            chat_id,
+            reply_to_message_id,
+            kind=kind,
+            question=question,
+            fields=["password"],
+            prompt=self._compose_login_credentials_message(
+                payload=payload,
+                question=question,
+                username_label=username_label,
+                stage="password",
+            ),
+        )
+        if status != "ok":
+            return {"action": "cancel", "proceed": False}
+
+        second_kv = self._parse_kv(second_text)
+        password_value = second_kv.get("password") or second_text
+        return {
+            "action": "continue",
+            "proceed": "true",
+            username_field: username_value,
+            "password": password_value,
+        }
+
+    def _build_intervention_callback(self, application, chat_id: int, reply_to_message_id: int | None):
+        def _callback(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            loop = self.loop
+            if loop is None:
+                return {"action": "cancel", "proceed": False}
+
+            kind = str(payload.get("kind") or "input").strip().lower()
+            question = str(payload.get("question") or "추가 입력이 필요합니다.")
+            if kind == "no_progress":
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._send_text(
+                            application.bot,
+                            chat_id,
+                            "\n".join(
+                                [
+                                    "상태 변화가 반복 감지되어 진행 전략을 조정합니다.",
+                                    question,
+                                    "기본값으로 계속 진행합니다. 중단하려면 /cancel 을 사용하세요.",
+                                ]
+                            ),
+                            reply_to_message_id,
+                        ),
+                        loop,
+                    )
+                    fut.result(timeout=15)
+                except Exception:
+                    pass
+                return {"action": "continue", "proceed": True}
+            fields = payload.get("fields")
+            if not isinstance(fields, list):
+                fields = []
+            attachments = payload.get("attachments")
+            attachment_items: list[dict] = []
+            if isinstance(attachments, list):
+                attachment_items = [item for item in attachments if isinstance(item, dict)]
+
+            normalized_fields = [str(v) for v in fields]
+            if self._should_collect_login_credentials(kind, normalized_fields):
+                return self._collect_login_credentials(
+                    application,
+                    chat_id,
+                    reply_to_message_id,
+                    kind=kind,
+                    question=question,
+                    fields=normalized_fields,
+                    attachments=attachment_items,
+                    payload=payload,
+                )
+
+            text = self._compose_intervention_message(payload, normalized_fields)
+
+            pending = _PendingIntervention(
+                kind=kind,
+                question=question,
+                fields=normalized_fields,
+                event=threading.Event(),
+            )
+            with self._pending_lock:
+                self._pending_interventions[chat_id] = pending
+
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._send_text(application.bot, chat_id, text, reply_to_message_id),
+                    loop,
+                )
+                fut.result(timeout=15)
+                if attachment_items:
+                    fut_attach = asyncio.run_coroutine_threadsafe(
+                        self._send_attachments(
+                            application.bot,
+                            chat_id,
+                            attachment_items[:1],
+                            reply_to_message_id,
+                        ),
+                        loop,
+                    )
+                    fut_attach.result(timeout=15)
+            except Exception:
+                with self._pending_lock:
+                    self._pending_interventions.pop(chat_id, None)
+                return {"action": "cancel", "proceed": False}
+
+            waited = pending.event.wait(timeout=600)
+            with self._pending_lock:
+                self._pending_interventions.pop(chat_id, None)
+            if not waited:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._send_text(
+                            application.bot,
+                            chat_id,
+                            "입력 대기 시간(10분) 초과로 실행을 취소했습니다.",
+                            reply_to_message_id,
+                        ),
+                        loop,
+                    )
+                except Exception:
+                    pass
+                return {"action": "cancel", "proceed": False}
+            return self._parse_intervention_response(
+                kind,
+                pending.response_text,
+                fields=list(pending.fields or []),
+            )
+
+        return _callback
+
+    @classmethod
+    def _normalize_freeform_intent(cls, value: Any) -> str:
+        intent = str(value or "").strip().lower()
+        if intent in {"goal", "run", "execute", "test", "task"}:
+            return "goal"
+        if intent in {"help", "usage", "guide", "howto"}:
+            return "help"
+        if intent in {"status", "screen", "progress", "current"}:
+            return "status"
+        if intent in {"pending", "pending_response", "handoff", "handoff_reply", "answer"}:
+            return "pending_response"
+        if intent in {"cancel", "stop"}:
+            return "cancel"
+        if intent in {"casual", "chat", "smalltalk", "greeting", "thanks"}:
+            return "casual"
+        if intent in {"clarify", "unknown", "ambiguous", "not_goal"}:
+            return "clarify"
+        return ""
+
+    @classmethod
+    def _fallback_chatbot_route(cls, text: str, *, pending: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        raw = re.sub(r"\s+", " ", str(text or "")).strip()
+        if pending:
+            return {
+                "intent": "pending_response",
+                "confidence": 0.0,
+                "reply": "",
+                "goal_text": "",
+                "pending_text": raw,
+                "skill": "answer_pending_input",
+            }
+        return {
+            "intent": "clarify",
+            "confidence": 0.0,
+            "reply": "챗봇 판단을 못 했어요. 실행할 테스트 목표라면 한 문장으로 다시 보내주세요.",
+            "goal_text": "",
+            "pending_text": "",
+            "skill": "ask_clarification",
+        }
+
+    @staticmethod
+    def _chatbot_route_token_budget(provider: str) -> int:
+        raw = str(os.getenv("GAIA_TELEGRAM_CHATBOT_MAX_TOKENS") or "").strip()
+        if raw:
+            try:
+                return max(256, int(raw))
+            except Exception:
+                pass
+        if str(provider or "").strip().lower() == "gemini":
+            return 2048
+        return 512
+
+    @classmethod
+    def _llm_route_telegram_message(
+        cls,
+        text: str,
+        *,
+        pending: Mapping[str, Any] | None = None,
+        active: bool = False,
+        queued: int = 0,
+        client: Any | None = None,
+        provider: str = "",
+        model: str = "",
+        target_url: str = "",
+        qa_mode: str = "",
+    ) -> dict[str, Any]:
+        if os.getenv("GAIA_TELEGRAM_LLM_MESSAGE_INTENT", "1").strip().lower() in {"0", "false", "off", "no"}:
+            return {}
+        try:
+            from gaia import chat_hub
+
+            if client is None:
+                client = chat_hub._get_chat_router_client()
+            if client is None or not hasattr(client, "analyze_text"):
+                return {}
+            pending_fields = []
+            pending_kind = ""
+            pending_question = ""
+            if isinstance(pending, Mapping):
+                pending_kind = str(pending.get("kind") or "").strip()
+                pending_question = str(pending.get("question") or "").strip()
+                fields = pending.get("fields")
+                if isinstance(fields, list):
+                    pending_fields = [str(item) for item in fields if str(item).strip()]
+            context_payload = {
+                "active_run": bool(active),
+                "queued_count": max(0, int(queued or 0)),
+                "target_url": str(target_url or "").strip(),
+                "qa_mode": str(qa_mode or "").strip(),
+                "pending": {
+                    "kind": pending_kind,
+                    "question": pending_question,
+                    "fields": pending_fields,
+                },
+            }
+            prompt = (
+                "당신은 GAIA Telegram 챗봇의 저지연 라우터입니다. reasoning은 low로, 빠르게 판단하세요.\n"
+                "사용자 메시지를 아래 skill 중 하나에 연결합니다. 반드시 JSON만 출력하세요.\n\n"
+                "사용 가능한 skill:\n"
+                "- run_gaia_goal: 사용자가 외부 사이트/브라우저에서 수행하거나 검증할 웹 QA 목표를 준 경우. "
+                "짧은 명령이라도 현재 화면에서 할 행동이면 이 skill입니다. 예: 로그인해줘, 재생해줘, 네이버에서 사용법 검색해줘.\n"
+                "- explain_gaia: 사용법, GAIA가 무엇인지, 어떤 문장을 보내야 하는지 설명해야 하는 경우.\n"
+                "- show_status: 현재 상태, 현재 화면, 진행 상황, 스크린샷을 묻는 경우.\n"
+                "- casual_chat: 인사, 감사, 사과, 농담, 짧은 반응처럼 실행할 목표가 없는 대화.\n"
+                "- answer_pending_input: pending이 있고 사용자가 필요한 값이나 답변을 보낸 경우. 숫자/아이디/비밀번호/OTP처럼 짧아도 이 skill입니다.\n"
+                "- cancel_run: 사용자가 취소/중단을 명확히 요청한 경우.\n\n"
+                "- ask_clarification: 실행할 웹 QA 목표인지 애매해서 한 문장 목표를 다시 물어야 하는 경우.\n\n"
+                "출력 스키마:\n"
+                "{\n"
+                '  "intent": "goal|help|status|casual|pending_response|cancel|clarify",\n'
+                '  "skill": "run_gaia_goal|explain_gaia|show_status|casual_chat|answer_pending_input|cancel_run|ask_clarification",\n'
+                '  "confidence": 0.0,\n'
+                '  "reply": "",\n'
+                '  "goal_text": "",\n'
+                '  "pending_text": ""\n'
+                "}\n\n"
+                "규칙:\n"
+                "- goal이면 goal_text에 실행할 목표 문장을 넣습니다. 원문을 보존하되 필요하면 살짝 정리합니다.\n"
+                "- help/casual이면 reply를 한국어 Telegram 답장으로 짧게 작성합니다.\n"
+                "- 짧은 인사, 오타 섞인 인사, 실행 동사가 없는 잡담은 goal이 아니라 casual 또는 clarify입니다.\n"
+                "- goal은 브라우저에서 수행할 행동이나 확인 대상이 명확할 때만 선택합니다.\n"
+                "- status이면 reply는 비워도 됩니다. 시스템이 실제 상태를 붙입니다.\n"
+                "- pending_response이면 pending_text에 사용자가 보낸 값을 그대로 보존합니다. 내부 필드명은 만들지 않습니다.\n"
+                "- '사용법'이라는 단어가 있어도 '네이버에서 사용법 검색해줘'처럼 사이트 행동이면 goal입니다.\n"
+                "- pending이 있으면 잡담/도움말/상태 조회가 아닌 한 answer_pending_input을 우선합니다.\n\n"
+                f"현재 컨텍스트:\n{json.dumps(context_payload, ensure_ascii=False, indent=2)}\n\n"
+                f"사용자 메시지:\n{text}"
+            )
+            max_tokens = cls._chatbot_route_token_budget(provider)
+            response = client.analyze_text(prompt, max_completion_tokens=max_tokens, temperature=0.0)
+            if not str(response or "").strip() and str(provider or "").strip().lower() == "gemini":
+                response = client.analyze_text(
+                    prompt,
+                    max_completion_tokens=max(max_tokens * 2, 4096),
+                    temperature=0.0,
+                )
+            data = json.loads(chat_hub._extract_json_object(str(response)))
+            if isinstance(data, dict):
+                intent = cls._normalize_freeform_intent(data.get("intent"))
+                if not intent:
+                    return {}
+                try:
+                    confidence = float(data.get("confidence") or 0.0)
+                except Exception:
+                    confidence = 0.0
+                return {
+                    "intent": intent,
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "reply": str(data.get("reply") or "").strip(),
+                    "goal_text": str(data.get("goal_text") or "").strip(),
+                    "pending_text": str(data.get("pending_text") or "").strip(),
+                    "skill": str(data.get("skill") or "").strip(),
+                }
+        except Exception:
+            return {}
+        return {}
+
+    def _get_chatbot_client(self) -> Any | None:
+        provider = str(getattr(self.hub_context, "provider", "") or "").strip().lower() or "openai"
+        model = str(getattr(self.hub_context, "model", "") or "").strip()
+        cache_key = (provider, model)
+        if self._chatbot_client is not None and self._chatbot_client_key == cache_key:
+            return self._chatbot_client
+        try:
+            if provider == "gemini":
+                from gaia.src.phase4.llm_vision_client_gemini import GeminiVisionClient
+
+                self._chatbot_client = GeminiVisionClient(model=model or None)
+            else:
+                from gaia.src.phase4.llm_vision_client import LLMVisionClient
+
+                reasoning_effort = str(os.getenv("GAIA_TELEGRAM_CHATBOT_REASONING_EFFORT", "low") or "low")
+                self._chatbot_client = LLMVisionClient(
+                    provider=provider,
+                    model=model or None,
+                    reasoning_effort=reasoning_effort if provider == "openai" else None,
+                )
+            self._chatbot_client_key = cache_key
+            return self._chatbot_client
+        except Exception:
+            self._chatbot_client = None
+            self._chatbot_client_key = ("", "")
+            return None
+
+    def _route_telegram_message(
+        self,
+        text: str,
+        *,
+        chat_id: int,
+        pending: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._state_lock:
+            active = self._active_runs.get(chat_id) is not None
+            queued = int(self._queued_count_by_chat.get(chat_id, 0) or 0)
+        route = self._llm_route_telegram_message(
+            text,
+            pending=pending,
+            active=active,
+            queued=queued,
+            client=self._get_chatbot_client(),
+            provider=str(getattr(self.hub_context, "provider", "") or "").strip(),
+            model=str(getattr(self.hub_context, "model", "") or "").strip(),
+            target_url=str(getattr(self.hub_context, "url", "") or "").strip(),
+            qa_mode=str(getattr(self.hub_context, "qa_mode", "") or "").strip(),
+        )
+        if route:
+            return route
+        return self._fallback_chatbot_route(text, pending=pending)
+
+    @classmethod
+    def _classify_freeform_message_intent(cls, text: str) -> str:
+        route = cls._llm_route_telegram_message(text)
+        if route:
+            return str(route.get("intent") or "goal")
+        return str(cls._fallback_chatbot_route(text).get("intent") or "clarify")
+
+    @staticmethod
+    def _field_label(field: str) -> str:
+        normalized = str(field or "").strip().lower()
+        labels = {
+            "username": "아이디",
+            "email": "이메일",
+            "password": "비밀번호",
+            "otp": "인증번호",
+            "captcha": "보안문자",
+            "answer": "정답",
+        }
+        return labels.get(normalized, normalized or "필요한 값")
+
+    @classmethod
+    def _format_pending_help(cls, kind: str, question: str, fields: list[str]) -> str:
+        visible_fields = [
+            str(field or "").strip()
+            for field in fields
+            if str(field or "").strip().lower()
+            not in {"action", "proceed", "manual_done", "instruction", "auth_mode", "return_credentials"}
+        ]
+        if visible_fields:
+            labels = [cls._field_label(field) for field in visible_fields]
+            if "password" in {field.lower() for field in visible_fields} and (
+                "username" in {field.lower() for field in visible_fields}
+                or "email" in {field.lower() for field in visible_fields}
+            ):
+                labels = [cls._field_label(cls._sequential_login_field(visible_fields))]
+            ask = ", ".join(labels)
+            return (
+                "지금은 실행을 잠깐 멈추고 사용자 입력을 기다리는 중이에요.\n"
+                f"필요한 것: {ask}\n"
+                "그 값만 답장으로 보내주시면 제가 이어서 처리할게요.\n"
+                "중단하려면 /cancel"
+            )
+        context = re.sub(r"\s+", " ", str(question or "")).strip()
+        return (
+            "지금은 추가 안내를 기다리는 중이에요.\n"
+            + (f"요청 내용: {context}\n" if context else "")
+            + "원하는 처리 방향을 한 문장으로 답장해 주세요.\n"
+            "중단하려면 /cancel"
+        )
+
+    def _format_casual_reply(self, chat_id: int, text: str) -> str:
+        with self._state_lock:
+            active = self._active_runs.get(chat_id)
+            queued = int(self._queued_count_by_chat.get(chat_id, 0) or 0)
+        if active is not None:
+            cmd = (active.raw_command or "").strip()
+            if len(cmd) > 70:
+                cmd = cmd[:67] + "..."
+            return (
+                "괜찮아요. 지금 요청을 계속 처리하고 있어요.\n"
+                f"진행 중: {cmd or '현재 작업'}\n"
+                "상태가 궁금하면 `현재 상태`라고 보내주세요."
+            )
+        if queued > 0:
+            return (
+                "좋아요, 앞선 요청이 있어서 순서대로 처리할게요.\n"
+                "새 테스트 목표를 보내면 그 다음 순서로 넣어둘게요."
+            )
+        return (
+            "안녕하세요! GAIA예요.\n"
+            "새 테스트 목표를 문장으로 보내면 바로 실행 준비할게요.\n"
+            "상태가 궁금하면 `현재 상태`라고 보내주세요."
+        )
+
+    def _format_help_message(self, chat_id: int) -> str:
+        with self._pending_lock:
+            pending = self._pending_interventions.get(chat_id)
+        if pending is not None:
+            return self._format_pending_help(
+                pending.kind,
+                pending.question,
+                list(pending.fields or []),
+            )
+        hub_pending = dict(getattr(self.hub_context, "pending_user_input", {}) or {})
+        if hub_pending:
+            fields = hub_pending.get("fields")
+            if not isinstance(fields, list):
+                fields = []
+            return self._format_pending_help(
+                str(hub_pending.get("kind") or "input"),
+                str(hub_pending.get("question") or "추가 입력이 필요합니다."),
+                [str(item) for item in fields],
+            )
+
+        with self._state_lock:
+            active = self._active_runs.get(chat_id)
+            queued = int(self._queued_count_by_chat.get(chat_id, 0) or 0)
+        if active is not None:
+            return (
+                "지금은 요청을 실행 중이에요.\n"
+                "`현재 상태`라고 보내면 진행 상황을 볼 수 있고, 새 테스트 목표를 보내면 다음 작업으로 처리할게요.\n"
+                "로그인/인증이 필요하면 제가 그때 필요한 값만 물어볼게요."
+            )
+        if queued > 0:
+            return (
+                "앞선 요청이 있어서 순서대로 처리 중이에요.\n"
+                "`현재 상태`라고 보내면 대기/진행 상황을 볼 수 있어요.\n"
+                "새 테스트 목표는 한 문장으로 보내면 이어서 실행할게요."
+            )
+        return (
+            "GAIA에게는 테스트 목표를 한 문장으로 보내면 돼요.\n"
+            "예: 인천대 사이버캠퍼스에서 12주차 첫 번째 강의를 열고 재생되는지 확인해줘\n"
+            "예: 네이버 뉴스에서 스포츠 > 축구로 이동한 뒤 순위표 상위 3개 팀이 보이는지 확인해줘\n"
+            "실행 중에는 `현재 상태` 또는 `현재 화면`이라고 물어볼 수 있어요."
+        )
+
+    @staticmethod
+    def _format_command_received_message(raw: str, *, queued_ahead: int = 0) -> str:
+        preview = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if len(preview) > 90:
+            preview = preview[:89] + "…"
+        if queued_ahead > 0:
+            return (
+                "앞선 요청이 끝나면 이어서 실행할게요.\n"
+                + (f"다음 요청: {preview}\n" if preview else "")
+                + "진행 상황은 `현재 상태`라고 보내면 확인할 수 있어요."
+            )
+        return (
+            "좋아요, 실행해볼게요.\n"
+            + (f"요청: {preview}\n" if preview else "")
+            + "진행 중 궁금하면 `현재 상태`라고 보내주세요."
+        )
+
+    @staticmethod
+    def _is_tracking_command(raw: str) -> bool:
+        text = re.sub(r"\s+", " ", str(raw or "").strip())
+        lowered = text.lower()
+        compact = lowered.replace(" ", "")
+        return compact in {
+            "/상태추적",
+            "상태추적",
+            "/tracking",
+            "tracking",
+            "/progress",
+            "progress",
+        } or lowered.startswith("/상태 추적") or lowered.startswith("상태 추적")
+
+    def _handle_tracking_command(self, raw: str, chat_id: int) -> str | None:
+        if not self._is_tracking_command(raw):
+            return None
+        text = re.sub(r"\s+", " ", str(raw or "").strip())
+        lowered = text.lower()
+        off_tokens = {"끄기", "중지", "해제", "off", "disable", "stop"}
+        status_tokens = {"status", "확인", "보기"}
+        wants_off = any(token in lowered for token in off_tokens)
+        wants_status = any(token in lowered for token in status_tokens) and not wants_off
+        with self._state_lock:
+            enabled = chat_id in self._tracking_enabled
+            if wants_off:
+                self._tracking_enabled.discard(chat_id)
+                self._tracking_last_signature.pop(chat_id, None)
+                return (
+                    "상태 추적을 껐어요.\n"
+                    "필요하면 `/상태 추적`으로 다시 켤 수 있어요."
+                )
+            if wants_status:
+                return "상태 추적: 켜짐" if enabled else "상태 추적: 꺼짐"
+            self._tracking_enabled.add(chat_id)
+        return (
+            "상태 추적을 켰어요.\n"
+            "이제 목표 시작/완료, Deep QA 라운드와 케이스 진행 정도만 알려드릴게요.\n"
+            "실행 중 추가 지시를 보내면 현재 실행에 참고 지시로 반영합니다."
+        )
+
+    def _tracking_enabled_for(self, chat_id: int) -> bool:
+        with self._state_lock:
+            return chat_id in self._tracking_enabled
+
+    def _record_live_intervention(self, chat_id: int, raw: str) -> str:
+        instruction = re.sub(r"\s+", " ", str(raw or "").strip())
+        if not instruction:
+            return "반영할 내용이 비어 있어요. 추가 지시를 한 문장으로 보내주세요."
+        try:
+            from gaia import chat_hub
+
+            policy = chat_hub._compile_steering_policy(instruction, self.hub_context)
+        except Exception:
+            policy = {}
+        payload = {
+            "seq": str(time.time_ns()),
+            "instruction": instruction,
+            "steering_policy": policy if isinstance(policy, dict) else {},
+            "received_at": time.time(),
+        }
+        with self._state_lock:
+            self._live_interventions[chat_id] = payload
+            active = self._active_runs.get(chat_id)
+            if active is not None:
+                active.last_user_note = instruction
+        if isinstance(policy, dict) and policy:
+            self.hub_context.steering_policy = dict(policy)
+        if self.hub_context.on_session_update:
+            try:
+                self.hub_context.on_session_update(self.hub_context)
+            except Exception:
+                pass
+        return (
+            "알겠어요. 현재 실행에 참고 지시로 반영할게요.\n"
+            "다음 판단 지점부터 이 내용을 우선 고려합니다."
+        )
+
+    def _build_live_intervention_provider(self, chat_id: int):
+        def _provider() -> Optional[Dict[str, Any]]:
+            with self._state_lock:
+                payload = self._live_interventions.get(chat_id)
+                return dict(payload) if isinstance(payload, dict) else None
+
+        return _provider
+
+    @classmethod
+    def _format_tracking_progress_message(cls, event: Mapping[str, Any]) -> str:
+        kind = str(event.get("kind") or "").strip()
+        goal = cls._truncate(event.get("goal"), 100)
+        if kind == "goal_started":
+            return f"상태 추적\n- 시작: {goal}\n- 다음: 목표 수행"
+        if kind == "goal_finished":
+            status = cls._truncate(event.get("status") or ("SUCCESS" if event.get("success") else "FAILED"), 32)
+            reason = cls._truncate(event.get("reason"), 120)
+            return f"상태 추적\n- 완료: 기본 목표 {status}\n- 이유: {reason}\n- 다음: 확장 검증 여부 확인"
+        if kind == "adaptive_started":
+            mode = cls._truncate(event.get("mode") or "adaptive_qa", 40)
+            return f"상태 추적\n- Deep QA 확장 시작\n- 모드: {mode}"
+        if kind == "adaptive_round_started":
+            return (
+                "상태 추적\n"
+                f"- 확장 라운드 {event.get('round') or '-'} 시작\n"
+                f"- 새 테스트: {event.get('count') or 0}건"
+            )
+        if kind == "edge_started":
+            return (
+                "상태 추적\n"
+                f"- 진행 예정: {cls._truncate(event.get('name'), 100)}\n"
+                "- 다음: 이 케이스 실행"
+            )
+        if kind == "edge_finished":
+            return (
+                "상태 추적\n"
+                f"- 완료: {cls._truncate(event.get('name'), 90)}\n"
+                f"- 결과: {cls._truncate(event.get('status'), 20)}\n"
+                f"- 이유: {cls._truncate(event.get('reason'), 120)}"
+            )
+        if kind == "adaptive_finished":
+            summary = event.get("summary") if isinstance(event.get("summary"), Mapping) else {}
+            passed = summary.get("passed_edge_case_count", 0)
+            failed = summary.get("failed_edge_case_count", 0)
+            skipped = summary.get("skipped_edge_case_count", 0)
+            unsupported = summary.get("unsupported_edge_case_count", 0)
+            return (
+                "상태 추적\n"
+                "- Deep QA 확장 완료\n"
+                f"- 결과: PASS {passed} / FAIL {failed} / SKIP {skipped} / UNSUPPORTED {unsupported}"
+            )
+        if kind == "adaptive_done":
+            reason = cls._truncate(event.get("reason") or "추가 케이스 없음", 80)
+            return f"상태 추적\n- 확장 검증 종료\n- 이유: {reason}"
+        return ""
+
+    def _build_progress_callback(self, application, chat_id: int, reply_to_message_id: int | None):
+        def _callback(event: Dict[str, Any]) -> None:
+            if not isinstance(event, dict):
+                return
+            kind = str(event.get("kind") or "").strip()
+            message = self._format_tracking_progress_message(event)
+            with self._state_lock:
+                active = self._active_runs.get(chat_id)
+                if active is not None:
+                    active.progress_events += 1
+                    if kind in {"goal_started", "edge_started"}:
+                        active.current = str(event.get("goal") or event.get("name") or active.current or "").strip()
+                        active.next_action = "실행 중"
+                    elif kind in {"goal_finished", "edge_finished"}:
+                        label = str(event.get("goal") or event.get("name") or "").strip()
+                        status = str(event.get("status") or "").strip()
+                        if label:
+                            active.completed.append(f"{label} ({status or 'done'})")
+                            active.completed = active.completed[-6:]
+                    elif kind == "adaptive_round_started":
+                        active.next_action = f"확장 라운드 {event.get('round') or '-'}"
+                enabled = chat_id in self._tracking_enabled
+                signature = json.dumps(
+                    {"kind": kind, "goal": event.get("goal"), "name": event.get("name"), "status": event.get("status")},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if enabled and signature and self._tracking_last_signature.get(chat_id) == signature:
+                    message = ""
+                if enabled and signature:
+                    self._tracking_last_signature[chat_id] = signature
+            if not message or not self._tracking_enabled_for(chat_id):
+                return
+            loop = self.loop
+            if loop is None:
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_text(application.bot, chat_id, message, reply_to_message_id),
+                    loop,
+                )
+            except Exception:
+                pass
+
+        return _callback
+
+    def _format_live_status(self, chat_id: int) -> str:
+        with self._pending_lock:
+            pending = self._pending_interventions.get(chat_id)
+
+        if pending is not None:
+            kind = pending.kind or "input"
+            question = str(pending.question or "추가 입력 대기 중")
+            return (
+                "현재 상태\n"
+                f"- 추가 입력 대기 중 ({kind})\n"
+                f"- 요청 내용: {question}\n"
+                "- 응답을 보내면 실행이 계속됩니다."
+            )
+
+        with self._state_lock:
+            active = self._active_runs.get(chat_id)
+            queued = int(self._queued_count_by_chat.get(chat_id, 0) or 0)
+
+        if active is not None:
+            elapsed = max(0, int(time.time() - active.started_at))
+            cmd = (active.raw_command or "").strip()
+            if len(cmd) > 120:
+                cmd = cmd[:117] + "..."
+            lines = [
+                "현재 상태",
+                "- 실행 중",
+                f"- 요청: {cmd}",
+                f"- 경과: {elapsed}초",
+                f"- 대기열: {queued}건",
+            ]
+            if active.current:
+                lines.append(f"- 현재 테스트: {self._truncate(active.current, 100)}")
+            if active.next_action:
+                lines.append(f"- 다음: {self._truncate(active.next_action, 100)}")
+            if active.last_user_note:
+                lines.append(f"- 최근 사용자 개입: {self._truncate(active.last_user_note, 100)}")
+            if active.completed:
+                lines.append("- 최근 완료")
+                for item in active.completed[-3:]:
+                    lines.append(f"  · {self._truncate(item, 100)}")
+            return "\n".join(lines)
+
+        if queued > 0:
+            return (
+                "현재 상태\n"
+                "- 대기 중\n"
+                f"- 대기열: {queued}건"
+            )
+
+        return "현재 상태\n- 실행 중인 작업이 없습니다."
+
+    async def _worker_loop(self, application) -> None:
+        while True:
+            item = await self.queue.get()
+            if item is None:
+                return
+            with self._state_lock:
+                queued_now = int(self._queued_count_by_chat.get(item.chat_id, 0) or 0)
+                if queued_now > 0:
+                    self._queued_count_by_chat[item.chat_id] = queued_now - 1
+                self._active_runs[item.chat_id] = _ActiveRun(
+                    chat_id=item.chat_id,
+                    raw_command=item.raw_command,
+                    started_at=time.time(),
+                )
+                self._live_interventions.pop(item.chat_id, None)
+            sink = _BufferedSink()
+            try:
+                intervention_cb = self._build_intervention_callback(
+                    application,
+                    item.chat_id,
+                    item.reply_to_message_id,
+                )
+                progress_cb = self._build_progress_callback(
+                    application,
+                    item.chat_id,
+                    item.reply_to_message_id,
+                )
+                live_intervention_cb = self._build_live_intervention_provider(item.chat_id)
+                result = await asyncio.to_thread(
+                    dispatch_command,
+                    self.hub_context,
+                    item.raw_command,
+                    sink,
+                    self.memory_store,
+                    intervention_cb,
+                    progress_cb,
+                    live_intervention_cb,
+                )
+                payload_obj = build_command_payload(self.hub_context, item.raw_command, result)
+                if sink.lines:
+                    payload_obj["logs"] = sink.lines
+                payload_for_text = self._sanitize_payload_for_text(payload_obj)
+                report_mode = self._resolve_report_mode()
+                if report_mode == "legacy_json_text":
+                    payload = json.dumps(payload_for_text, ensure_ascii=False, indent=2)
+                else:
+                    payload = self._format_payload_text(payload_for_text, mode=report_mode)
+                    if not payload:
+                        payload = json.dumps(payload_for_text, ensure_ascii=False, indent=2)
+                await self._send_text(application.bot, item.chat_id, payload, item.reply_to_message_id)
+
+                attachment_failed = False
+                if result.attachments:
+                    try:
+                        await self._send_attachments(
+                            application.bot,
+                            item.chat_id,
+                            result.attachments,
+                            item.reply_to_message_id,
+                        )
+                    except Exception:
+                        attachment_failed = True
+
+                json_failed = False
+                if report_mode == "summary_with_json":
+                    sent = await self._send_json_report(
+                        application.bot,
+                        item.chat_id,
+                        payload_for_text,
+                        item.reply_to_message_id,
+                    )
+                    json_failed = not sent
+
+                if attachment_failed or json_failed:
+                    notes: list[str] = []
+                    if attachment_failed:
+                        notes.append("스크린샷 첨부 실패")
+                    if json_failed:
+                        notes.append("상세 JSON 첨부 실패")
+                    await self._send_text(
+                        application.bot,
+                        item.chat_id,
+                        "알림: " + ", ".join(notes),
+                        item.reply_to_message_id,
+                    )
+            except Exception as exc:
+                try:
+                    await self._send_text(
+                        application.bot,
+                        item.chat_id,
+                        f"명령 실행 중 오류: {exc}",
+                        item.reply_to_message_id,
+                    )
+                except Exception as send_exc:
+                    print(
+                        "[telegram/bridge] failed to send error report: "
+                        f"{type(send_exc).__name__}: {send_exc}"
+                    )
+            finally:
+                with self._state_lock:
+                    self._active_runs.pop(item.chat_id, None)
+                    self._live_interventions.pop(item.chat_id, None)
+
+    async def _normalize_document_command(self, message, context) -> str:
+        raw = (message.text or message.caption or "").strip()
+        if not message.document:
+            return raw
+        if not raw.startswith("/plan"):
+            return raw
+        upload_dir = Path.home() / ".gaia" / "telegram_uploads" / str(message.chat_id)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        filename = message.document.file_name or f"{message.document.file_unique_id}.bin"
+        safe_name = f"{int(time.time())}_{filename.replace('/', '_')}"
+        dest = upload_dir / safe_name
+        tg_file = await context.bot.get_file(message.document.file_id)
+        await tg_file.download_to_drive(custom_path=str(dest))
+
+        parts = raw.split(maxsplit=2)
+        if len(parts) >= 2:
+            return raw if len(parts) >= 3 else f"{raw} {dest}"
+        suffix = dest.suffix.lower()
+        if suffix == ".pdf":
+            return f"/plan spec {dest}"
+        if suffix == ".json":
+            return f"/plan plan {dest}"
+        return f"/plan resume {dest}"
+
+    async def _notify_admins_pair_request(self, bot, req: _PairRequest) -> None:
+        if not self.pairing.admin_ids:
+            return
+        who = req.full_name or req.username or str(req.chat_id)
+        text = (
+            "새 페어링 요청이 도착했습니다.\n"
+            f"- request_id: {req.request_id}\n"
+            f"- chat_id: {req.chat_id}\n"
+            f"- user: {who}\n"
+            f"- approve: /pair approve {req.request_id}\n"
+            f"- reject: /pair reject {req.request_id}"
+        )
+        for admin_id in sorted(self.pairing.admin_ids):
+            try:
+                await bot.send_message(chat_id=admin_id, text=text)
+            except Exception:
+                continue
+
+    async def _handle_pair_command(self, raw: str, chat_id: int, message, context) -> bool:
+        normalized = raw.strip()
+        lowered = normalized.lower()
+        if lowered in {"/whoami", "/chatid"}:
+            await message.reply_text(
+                f"chat_id={chat_id}\n"
+                f"admin={self.pairing.is_admin(chat_id)}\n"
+                f"approved={self.pairing.is_approved(chat_id)}"
+            )
+            return True
+
+        is_start = lowered == "/start"
+        if not is_start and not lowered.startswith("/pair"):
+            return False
+
+        user = message.from_user
+        username = user.username if user and user.username else ""
+        full_name = user.full_name if user and user.full_name else ""
+
+        if self.pairing.ensure_bootstrap_admin(chat_id, username=username, full_name=full_name):
+            await message.reply_text(
+                "초기 관리자 등록 완료: 현재 chat_id가 관리자/승인 사용자로 설정되었습니다.\n"
+                "다른 사용자는 /pair request 후 관리자 승인(/pair approve <request_id>)이 필요합니다."
+            )
+            if is_start:
+                return True
+
+        tokens = normalized.split()
+        sub = "request"
+        if len(tokens) >= 2 and tokens[0].lower() == "/pair":
+            sub = tokens[1].lower()
+        elif is_start:
+            sub = "request"
+
+        if sub in {"help", "h"}:
+            await message.reply_text(
+                "/pair request\n"
+                "/pair status\n"
+                "/pair pending (admin)\n"
+                "/pair approve <request_id> (admin)\n"
+                "/pair reject <request_id> (admin)\n"
+                "/pair revoke <chat_id> (admin)\n"
+                "/whoami"
+            )
+            return True
+
+        if sub in {"status"}:
+            pending = any(req.chat_id == chat_id for req in self.pairing.pending_rows())
+            await message.reply_text(
+                f"admin={self.pairing.is_admin(chat_id)}\n"
+                f"approved={self.pairing.is_approved(chat_id)}\n"
+                f"pending={pending}"
+            )
+            return True
+
+        if sub in {"request", "req"}:
+            if self._allowed(chat_id):
+                await message.reply_text("이미 승인된 사용자입니다.")
+                return True
+            req = self.pairing.request_pairing(chat_id, username=username, full_name=full_name)
+            await message.reply_text(
+                f"페어링 요청이 접수되었습니다. request_id={req.request_id}\n"
+                "관리자 승인 후 명령을 사용할 수 있습니다."
+            )
+            await self._notify_admins_pair_request(context.bot, req)
+            return True
+
+        if not self.pairing.is_admin(chat_id):
+            await message.reply_text("관리자만 실행할 수 있는 명령입니다.")
+            return True
+
+        if sub in {"pending", "list"}:
+            rows = self.pairing.pending_rows()
+            if not rows:
+                await message.reply_text("대기 중인 페어링 요청이 없습니다.")
+                return True
+            lines = ["대기 중 요청:"]
+            for req in rows[:30]:
+                who = req.full_name or req.username or str(req.chat_id)
+                lines.append(f"- {req.request_id} chat_id={req.chat_id} user={who}")
+            await message.reply_text("\n".join(lines))
+            return True
+
+        if sub in {"approve"}:
+            if len(tokens) < 3:
+                await message.reply_text("사용법: /pair approve <request_id>")
+                return True
+            request_id = tokens[2].strip()
+            req = self.pairing.approve(request_id)
+            if not req:
+                await message.reply_text(f"요청을 찾지 못했습니다: {request_id}")
+                return True
+            await message.reply_text(f"승인 완료: request_id={request_id}, chat_id={req.chat_id}")
+            try:
+                await context.bot.send_message(
+                    chat_id=req.chat_id,
+                    text="GAIA 사용 승인이 완료되었습니다. 이제 명령을 사용할 수 있습니다.",
+                )
+            except Exception:
+                pass
+            return True
+
+        if sub in {"reject", "deny"}:
+            if len(tokens) < 3:
+                await message.reply_text("사용법: /pair reject <request_id>")
+                return True
+            request_id = tokens[2].strip()
+            req = self.pairing.reject(request_id)
+            if not req:
+                await message.reply_text(f"요청을 찾지 못했습니다: {request_id}")
+                return True
+            await message.reply_text(f"거절 완료: request_id={request_id}, chat_id={req.chat_id}")
+            try:
+                await context.bot.send_message(
+                    chat_id=req.chat_id,
+                    text="GAIA 사용 요청이 거절되었습니다.",
+                )
+            except Exception:
+                pass
+            return True
+
+        if sub in {"revoke", "remove"}:
+            if len(tokens) < 3:
+                await message.reply_text("사용법: /pair revoke <chat_id>")
+                return True
+            try:
+                target_chat_id = int(tokens[2].strip())
+            except ValueError:
+                await message.reply_text("chat_id는 숫자여야 합니다.")
+                return True
+            if self.pairing.revoke(target_chat_id):
+                await message.reply_text(f"권한 해제 완료: chat_id={target_chat_id}")
+            else:
+                await message.reply_text(f"권한 해제 실패(없거나 관리자): chat_id={target_chat_id}")
+            return True
+
+        await message.reply_text("알 수 없는 /pair 명령입니다. /pair help")
+        return True
+
+    async def handle_message(self, update, context) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
+        chat_id = int(chat.id)
+
+        raw = (message.text or "").strip()
+        if message.document:
+            raw = await self._normalize_document_command(message, context)
+        if not raw:
+            return
+
+        pending: Optional[_PendingIntervention] = None
+        with self._pending_lock:
+            pending = self._pending_interventions.get(chat_id)
+        if pending is not None:
+            lowered = raw.strip().lower()
+            tracking_reply = self._handle_tracking_command(raw, chat_id)
+            if tracking_reply is not None:
+                await message.reply_text(tracking_reply)
+                return
+            if lowered in {"/cancel", "cancel", "취소"}:
+                pending.response_text = "cancel"
+                pending.event.set()
+                if pending.ack_text:
+                    await message.reply_text(pending.ack_text)
+                return
+            if lowered.startswith("/pair"):
+                await message.reply_text("현재 실행이 추가 입력을 기다리는 중입니다. 응답 텍스트 또는 /cancel을 보내주세요.")
+                return
+            if lowered.startswith("/") and lowered not in {"/cancel"}:
+                await message.reply_text("현재 실행이 추가 입력을 기다리는 중입니다. 응답 텍스트를 보내거나 /cancel을 입력하세요.")
+                return
+
+            pending_context = {
+                "kind": pending.kind,
+                "question": pending.question,
+                "fields": list(pending.fields or []),
+            }
+            route = self._route_telegram_message(raw, chat_id=chat_id, pending=pending_context)
+            intent = str(route.get("intent") or "pending_response")
+            if intent == "status":
+                await message.reply_text(self._format_live_status(chat_id))
+                return
+            if intent == "help":
+                await message.reply_text(str(route.get("reply") or "").strip() or self._format_help_message(chat_id))
+                return
+            if intent == "casual":
+                await message.reply_text(
+                    str(route.get("reply") or "").strip()
+                    or self._format_pending_help(
+                        pending.kind,
+                        pending.question,
+                        list(pending.fields or []),
+                    )
+                )
+                return
+            if intent == "clarify":
+                await message.reply_text(
+                    str(route.get("reply") or "").strip()
+                    or self._format_pending_help(
+                        pending.kind,
+                        pending.question,
+                        list(pending.fields or []),
+                    )
+                )
+                return
+            if intent == "cancel":
+                pending.response_text = "cancel"
+                pending.event.set()
+                if pending.ack_text:
+                    await message.reply_text(pending.ack_text)
+                return
+            pending.response_text = (
+                str(route.get("pending_text") or route.get("goal_text") or "").strip()
+                or raw
+            )
+            pending.event.set()
+            if pending.ack_text:
+                await message.reply_text(pending.ack_text)
+            return
+
+        if await self._handle_pair_command(raw, chat_id, message, context):
+            return
+
+        if not self._allowed(chat_id):
+            await message.reply_text(
+                "미승인 사용자입니다. /pair request 로 승인 요청 후 관리자 승인을 받아주세요.\n"
+                "chat_id 확인: /whoami"
+            )
+            return
+
+        tracking_reply = self._handle_tracking_command(raw, chat_id)
+        if tracking_reply is not None:
+            await message.reply_text(tracking_reply)
+            return
+
+        hub_pending = dict(getattr(self.hub_context, "pending_user_input", {}) or {})
+        route_pending = None
+        if hub_pending:
+            kind = str(hub_pending.get("kind") or "input").strip().lower()
+            fields = hub_pending.get("fields")
+            if not isinstance(fields, list):
+                fields = []
+            normalized_fields = [str(item) for item in fields]
+            route_pending = {
+                "kind": kind,
+                "question": str(hub_pending.get("question") or "추가 입력이 필요합니다."),
+                "fields": normalized_fields,
+            }
+
+        route = self._route_telegram_message(raw, chat_id=chat_id, pending=route_pending)
+        intent = str(route.get("intent") or "goal")
+        if intent == "status":
+            await message.reply_text(self._format_live_status(chat_id))
+            return
+
+        if intent == "help":
+            await message.reply_text(str(route.get("reply") or "").strip() or self._format_help_message(chat_id))
+            return
+
+        if hub_pending:
+            kind = str(route_pending.get("kind") or "input") if isinstance(route_pending, dict) else "input"
+            normalized_fields = list(route_pending.get("fields") or []) if isinstance(route_pending, dict) else []
+            if intent == "casual":
+                await message.reply_text(
+                    str(route.get("reply") or "").strip()
+                    or self._format_pending_help(
+                        kind,
+                        str(route_pending.get("question") or "추가 입력이 필요합니다.") if isinstance(route_pending, dict) else "",
+                        normalized_fields,
+                    )
+                )
+                return
+            response_text = str(route.get("pending_text") or route.get("goal_text") or "").strip() or raw
+            if intent == "cancel":
+                response_text = "/cancel"
+            response = self._parse_intervention_response(kind, response_text, fields=normalized_fields)
+            self.hub_context.pending_user_response = response
+            self.hub_context.pending_user_input = {}
+            if self.hub_context.on_session_update:
+                try:
+                    self.hub_context.on_session_update(self.hub_context)
+                except Exception:
+                    pass
+            await message.reply_text("좋아요, 답장 받았어요. 이어서 진행해볼게요.")
+            return
+
+        if intent == "casual":
+            await message.reply_text(str(route.get("reply") or "").strip() or self._format_casual_reply(chat_id, raw))
+            return
+
+        if intent == "clarify":
+            await message.reply_text(
+                str(route.get("reply") or "").strip()
+                or "실행할 목표라면 어떤 화면에서 무엇을 확인할지 한 문장으로 보내주세요."
+            )
+            return
+
+        with self._state_lock:
+            active_tracking_run = self._active_runs.get(chat_id) if chat_id in self._tracking_enabled else None
+        if active_tracking_run is not None:
+            if intent == "cancel":
+                self.hub_context.stop_requested = True
+                self.hub_context.pending_user_response = {"action": "cancel", "proceed": "false"}
+                if self.hub_context.on_session_update:
+                    try:
+                        self.hub_context.on_session_update(self.hub_context)
+                    except Exception:
+                        pass
+                await message.reply_text("중단 요청을 현재 실행에 전달했어요. 다음 안전 지점에서 반영됩니다.")
+                return
+            command_text = str(route.get("goal_text") or route.get("pending_text") or "").strip() or raw
+            await message.reply_text(self._record_live_intervention(chat_id, command_text))
+            return
+
+        queued_ahead = self.queue.qsize()
+        command_text = str(route.get("goal_text") or "").strip() or raw
+        with self._state_lock:
+            queued_now = int(self._queued_count_by_chat.get(chat_id, 0) or 0)
+            self._queued_count_by_chat[chat_id] = queued_now + 1
+        await self.queue.put(
+            _CommandEnvelope(
+                chat_id=chat_id,
+                raw_command=command_text,
+                reply_to_message_id=message.message_id,
+            )
+        )
+        await self._safe_reply_text(message, self._format_command_received_message(command_text, queued_ahead=queued_ahead))
+
+
+def _split_text(text: str, limit: int = 3900) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        parts.append(text[start : start + limit])
+        start += limit
+    return parts
+
+
+def _load_token(token_file: str) -> str:
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+    return token
+
+
+def _parse_bind(raw: str) -> tuple[str, int]:
+    text = (raw or "").strip()
+    if ":" not in text:
+        return text or "127.0.0.1", 8088
+    host, port = text.rsplit(":", 1)
+    try:
+        return host or "127.0.0.1", int(port)
+    except ValueError:
+        return host or "127.0.0.1", 8088
+
+
+def run_telegram_bridge(hub_context: HubContext, config: TelegramConfig) -> int:
+    try:
+        from telegram import Update
+        from telegram.request import HTTPXRequest
+        from telegram.ext import ApplicationBuilder, MessageHandler, filters
+    except Exception:
+        print(
+            "Telegram bridge requires python-telegram-bot. "
+            "Install dependency and retry.",
+        )
+        return 2
+
+    token = _load_token(config.token_file)
+    if not token:
+        print(f"Telegram token file not found or empty: {config.token_file}")
+        return 2
+    if not config.allowlist:
+        print(
+            "Telegram admin allowlist 미설정: 첫 번째 /start 사용자가 초기 관리자로 자동 등록됩니다."
+        )
+
+    memory_store = MemoryStore(enabled=True)
+    try:
+        memory_store.garbage_collect(retention_days=30)
+    except Exception:
+        pass
+    bridge = _TelegramBridge(
+        hub_context=hub_context,
+        config=config,
+        memory_store=memory_store,
+    )
+
+    request = HTTPXRequest(
+        connect_timeout=20.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=20.0,
+    )
+    updates_request = HTTPXRequest(
+        connect_timeout=20.0,
+        read_timeout=60.0,
+        write_timeout=30.0,
+        pool_timeout=20.0,
+    )
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .request(request)
+        .get_updates_request(updates_request)
+        .post_init(bridge.post_init)
+        .post_shutdown(bridge.post_shutdown)
+        .build()
+    )
+    app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND | filters.Document.ALL, bridge.handle_message))
+    app.add_error_handler(bridge.handle_error)
+
+    if config.mode == "webhook":
+        if not config.webhook_url:
+            print("Webhook mode requires --tg-webhook-url.")
+            return 2
+        host, port = _parse_bind(config.webhook_bind)
+        print(f"Telegram bridge started (webhook): {host}:{port}")
+        app.run_webhook(
+            listen=host,
+            port=port,
+            webhook_url=config.webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        return 0
+
+    print("Telegram bridge started (polling)")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    return 0

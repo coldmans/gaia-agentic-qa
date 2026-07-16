@@ -1,0 +1,74 @@
+"""Runtime checklist tracker for GAIA."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List
+
+from gaia.src.utils.models import ChecklistItem, TestScenario
+
+
+@dataclass(slots=True)
+class ChecklistTracker:
+    """Stores checklist progress and provides simple coverage metrics."""
+
+    items: Dict[str, ChecklistItem] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    def seed_from_scenarios(self, scenarios: Iterable[TestScenario]) -> None:
+        for scenario in scenarios:
+            feature_id = scenario.id or scenario.scenario
+            description = scenario.scenario
+            self.items[feature_id] = ChecklistItem(
+                feature_id=feature_id,
+                description=description,
+                checked=False,
+                status="pending",
+            )
+
+    def seed_from_goals(self, goals: Iterable[object]) -> None:
+        for goal in goals:
+            feature_id = getattr(goal, "id", None) or getattr(goal, "name", None)
+            description = getattr(goal, "name", "") or ""
+            if not feature_id:
+                continue
+            self.items[str(feature_id)] = ChecklistItem(
+                feature_id=str(feature_id),
+                description=str(description),
+                checked=False,
+                status="pending",
+            )
+
+    def mark_found(self, feature_id: str, *, evidence: str | None = None) -> bool:
+        return self.set_status(feature_id, "success", evidence=evidence)
+
+    def mark_by_predicate(self, predicate: str, *, evidence: str | None = None) -> List[ChecklistItem]:
+        hits: List[ChecklistItem] = []
+        for item in self.items.values():
+            if predicate.lower() in item.description.lower():
+                self.set_status(item.feature_id, "success", evidence=evidence)
+                hits.append(item)
+        return hits
+
+    def set_status(self, feature_id: str, status: str, *, evidence: str | None = None) -> bool:
+        """Update status (success, partial, failed, skipped, pending) and evidence for a checklist item."""
+        item = self.items.get(feature_id)
+        if not item:
+            return False
+
+        normalized = (status or "pending").lower()
+        item.status = normalized
+        item.checked = normalized in {"success", "partial"}
+
+        if evidence:
+            item.evidence = evidence
+        return True
+
+    def as_dict(self) -> Dict[str, ChecklistItem]:
+        return self.items
+
+    def coverage(self) -> float:
+        total = len(self.items)
+        if total == 0:
+            return 0.0
+        covered = sum(1 for item in self.items.values() if item.checked)
+        return covered / total

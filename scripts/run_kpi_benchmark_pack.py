@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ARTIFACT_ROOT = ROOT / "artifacts" / "benchmarks"
+RUN_SINGLE = ROOT / "scripts" / "run_goal_benchmark.py"
+PUSH_METRICS = ROOT / "scripts" / "push_metrics.py"
+MONITORING_CONFIG = Path.home() / ".gaia" / "monitoring.json"
+MIN_BENCHMARK_TIMEOUT_SEC = 600
+ADAPTIVE_QA_MODE = "adaptive_qa"
+DEEP_ADAPTIVE_QA_MODE = "deep_adaptive_qa"
+QA_MODE_CHOICES = (
+    "off",
+    "adaptive",
+    "deep",
+    ADAPTIVE_QA_MODE,
+    "deep_qa",
+    DEEP_ADAPTIVE_QA_MODE,
+)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.benchmark_blocking import (
+    is_blocked_user_action,
+    normalize_blocked_user_action_row,
+    summary_reason_code_summary,
+)
+from scripts.run_goal_benchmark import (
+    RUNTIME_ISOLATION_CHOICES,
+    _build_runtime_policy,
+    _normalize_runtime_isolation,
+    _prewarm_benchmark_runtime,
+)
+from scripts.runner_identity import resolve_runner_id
+
+
+def _normalize_qa_mode(value: str | None) -> str | None:
+    raw = str(value or "").strip().lower()
+    if raw in {"", "off", "none", "default", "false", "0"}:
+        return None
+    if raw in {"adaptive", ADAPTIVE_QA_MODE, "progressive_qa"}:
+        return ADAPTIVE_QA_MODE
+    if raw in {"deep", "deep_qa", "aggressive_qa", DEEP_ADAPTIVE_QA_MODE}:
+        return DEEP_ADAPTIVE_QA_MODE
+    return None
+
+
+def _benchmark_mode_label(qa_mode: str | None) -> str:
+    normalized = _normalize_qa_mode(qa_mode)
+    if normalized == DEEP_ADAPTIVE_QA_MODE:
+        return "deep_qa"
+    if normalized == ADAPTIVE_QA_MODE:
+        return "adaptive_qa"
+    return "standard"
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _resolve_path(path_value: str, *, base_dir: Path | None = None) -> Path:
+    path = Path(str(path_value).strip())
+    if path.is_absolute():
+        return path.resolve()
+    root_path = (ROOT / path).resolve()
+    if root_path.exists() or path.parts[:1] in {("gaia",), ("scripts",), ("docs",), ("artifacts",)}:
+        return root_path
+    if base_dir is not None:
+        return (base_dir / path).resolve()
+    return root_path
+
+
+def _load_suite_manifest(path: Path) -> List[Path]:
+    manifest_path = _resolve_path(str(path))
+    payload = _load_json(manifest_path)
+    suites = payload.get("suites")
+    if not isinstance(suites, list):
+        raise ValueError(f"suite manifest must contain a suites array: {manifest_path}")
+
+    suite_paths: List[Path] = []
+    for idx, item in enumerate(suites, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"suite manifest entry #{idx} must be an object")
+        suite_path = str(item.get("suite_path") or "").strip()
+        if not suite_path:
+            raise ValueError(f"suite manifest entry #{idx} is missing suite_path")
+        suite_paths.append(_resolve_path(suite_path, base_dir=manifest_path.parent))
+    if not suite_paths:
+        raise ValueError(f"suite manifest contains no suites: {manifest_path}")
+    return suite_paths
+
+
+def _resolve_suite_paths(*, suite_args: Iterable[str] | None, suite_manifest: str | None) -> List[Path]:
+    paths = [_resolve_path(item) for item in (suite_args or [])]
+    if suite_manifest:
+        paths.extend(_load_suite_manifest(Path(suite_manifest)))
+    if not paths:
+        raise ValueError("at least one --suite or --suite-manifest is required")
+    return paths
+
+
+def _effective_timeout_cap(value: int) -> int:
+    return max(MIN_BENCHMARK_TIMEOUT_SEC, int(value))
+
+
+def _latest_artifact_dir(after_ts: float) -> Path:
+    candidates = [
+        p for p in ARTIFACT_ROOT.iterdir()
+        if p.is_dir() and p.stat().st_mtime >= after_ts and (p / "summary.json").exists()
+    ]
+    if not candidates:
+        raise FileNotFoundError("benchmark artifact directory not found")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _summary_reason_code_summary(row: Dict[str, Any]) -> Dict[str, Any]:
+    return summary_reason_code_summary(row)
+
+
+def _is_blocked_user_action(row: Dict[str, Any]) -> bool:
+    return is_blocked_user_action(row)
+
+
+def _is_progress_stop_failure(row: Dict[str, Any]) -> bool:
+    if str(row.get("status") or "").strip().upper() == "SUCCESS":
+        return False
+    if _is_blocked_user_action(row):
+        return False
+    reason = str(row.get("reason") or "").lower()
+    stop_markers = (
+        "benchmark_timeout",
+        "timeout",
+        "중단",
+        "반복",
+        "stuck",
+        "no progress",
+        "observe_no_dom",
+        "화면 상태가 반복되어",
+    )
+    if any(marker in reason for marker in stop_markers):
+        return True
+    rc_summary = _summary_reason_code_summary(row)
+    return any(
+        str(code or "").strip().lower()
+        in {
+            "blocked_timeout",
+            "clarification_timeout",
+            "user_intervention_missing",
+            "dom_snapshot_retry_exhausted",
+            "observe_no_dom",
+        }
+        for code in rc_summary.keys()
+    )
+
+
+def _has_recovery_event(row: Dict[str, Any]) -> bool:
+    rc_summary = _summary_reason_code_summary(row)
+    recovery_prefixes = (
+        "stale_",
+        "resnapshot",
+        "fallback_",
+        "request_exception",
+        "auth_submit_timeout_recovered",
+        "dom_snapshot_retry",
+    )
+    for code in rc_summary.keys():
+        normalized = str(code or "").strip().lower()
+        if any(normalized.startswith(prefix) for prefix in recovery_prefixes):
+            return True
+    return False
+
+
+def _compute_pack_kpis(rows: List[Dict[str, Any]], repeats: int) -> Dict[str, Any]:
+    total = max(1, len(rows))
+    success_count = sum(1 for row in rows if str(row.get("status") or "").strip().upper() == "SUCCESS")
+    blocked_count = sum(1 for row in rows if _is_blocked_user_action(row))
+    primary_total = max(0, len(rows) - blocked_count)
+    stop_failure_count = sum(1 for row in rows if _is_progress_stop_failure(row))
+    recovery_rows = [row for row in rows if _has_recovery_event(row)]
+    recovery_success = sum(
+        1 for row in recovery_rows if str(row.get("status") or "").strip().upper() == "SUCCESS"
+    )
+
+    per_case: Dict[str, List[str]] = defaultdict(list)
+    for row in rows:
+        scenario_key = f"{row.get('suite_id')}::{row.get('scenario_id')}"
+        per_case[scenario_key].append(str(row.get("status") or "FAIL").upper())
+
+    reproducible = 0
+    observed = 0
+    flaky = 0
+    if repeats > 1:
+        for statuses in per_case.values():
+            if len(statuses) != repeats:
+                continue
+            observed += 1
+            uniq = set(statuses)
+            if uniq == {"SUCCESS"}:
+                reproducible += 1
+            if "SUCCESS" in uniq and len(uniq) > 1:
+                flaky += 1
+
+    avg_time = round(statistics.mean(float(row.get("duration_seconds") or 0.0) for row in rows), 2)
+    return {
+        "scenario_success_rate": round(success_count / total, 4),
+        "primary_success_rate": round(success_count / primary_total, 4) if primary_total else None,
+        "reproducibility_rate": round((reproducible / observed), 4) if observed else None,
+        "progress_stop_failure_rate": round(stop_failure_count / total, 4),
+        "self_recovery_rate": round((recovery_success / len(recovery_rows)), 4) if recovery_rows else None,
+        "intervention_rate": round(blocked_count / total, 4),
+        "avg_time_seconds": avg_time,
+        "flaky_rate": round((flaky / observed), 4) if observed else None,
+        "counts": {
+          "runs_total": len(rows),
+          "success": success_count,
+          "blocked": blocked_count,
+          "primary_runs": primary_total,
+          "progress_stop_failures": stop_failure_count,
+          "recovery_runs": len(recovery_rows),
+          "recovery_success": recovery_success
+        }
+    }
+
+
+def _run_suite(
+    suite_path: Path,
+    *,
+    repeats: int,
+    timeout_cap: int,
+    session_prefix: str,
+    push_metrics: bool,
+    runner_id: str,
+    env: Dict[str, str],
+    qa_mode: str | None = None,
+    runtime_isolation: str | None = None,
+) -> Dict[str, Any]:
+    started = time.time()
+    before = time.time()
+    cmd = _build_run_suite_command(
+        suite_path,
+        repeats=repeats,
+        timeout_cap=timeout_cap,
+        session_prefix=session_prefix,
+        push_metrics=push_metrics,
+        runner_id=runner_id,
+        qa_mode=qa_mode,
+        runtime_isolation=runtime_isolation,
+    )
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    stdout_lines: List[str] = []
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = str(raw_line or "").rstrip("\n")
+        stdout_lines.append(line)
+        print(line, flush=True)
+    return_code = proc.wait()
+    artifact_dir = _latest_artifact_dir(before)
+    summary = _load_json(artifact_dir / "summary.json")
+    rows = json.loads((artifact_dir / "results.json").read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        rows = []
+    suite_id = str(summary.get("suite_id") or suite_path.stem)
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        row["suite_id"] = suite_id
+        normalized_rows.append(normalize_blocked_user_action_row(row))
+    rows = normalized_rows
+    return {
+        "suite_id": suite_id,
+        "suite_path": str(suite_path),
+        "artifact_dir": str(artifact_dir),
+        "duration_seconds": round(time.time() - started, 2),
+        "exit_code": int(return_code),
+        "summary": summary,
+        "rows": rows,
+        "stdout": "\n".join(stdout_lines).strip(),
+        "stderr": "",
+    }
+
+
+def _build_run_suite_command(
+    suite_path: Path,
+    *,
+    repeats: int,
+    timeout_cap: int,
+    session_prefix: str,
+    push_metrics: bool,
+    runner_id: str = "",
+    qa_mode: str | None = None,
+    runtime_isolation: str | None = None,
+) -> List[str]:
+    normalized_qa_mode = _normalize_qa_mode(qa_mode)
+    normalized_runtime_isolation = _normalize_runtime_isolation(runtime_isolation)
+    cmd = [
+        sys.executable,
+        str(RUN_SINGLE),
+        "--suite",
+        str(suite_path),
+        "--repeats",
+        str(repeats),
+        "--timeout-cap",
+        str(timeout_cap),
+        "--session-prefix",
+        session_prefix,
+    ]
+    if str(runner_id or "").strip():
+        cmd.extend(["--runner-id", str(runner_id)])
+    if normalized_qa_mode:
+        cmd.extend(["--qa-mode", normalized_qa_mode])
+    if normalized_runtime_isolation:
+        cmd.extend(["--runtime-isolation", normalized_runtime_isolation])
+    if push_metrics:
+        cmd.append("--push-metrics")
+    return cmd
+
+
+def _run_harness(
+    *,
+    task_ids: List[str],
+    suite_ids: List[str],
+    tags: List[str],
+    contains: List[str],
+    repeats: int,
+    timeout_sec: int,
+    env: Dict[str, str],
+    qa_mode: str | None = None,
+) -> Dict[str, Any]:
+    normalized_qa_mode = _normalize_qa_mode(qa_mode)
+    cmd = [
+        sys.executable,
+        "-m",
+        "gaia.cli",
+        "harness",
+        "run",
+        "--json",
+        "--repeats",
+        str(repeats),
+        "--timeout-sec",
+        str(timeout_sec),
+    ]
+    if normalized_qa_mode:
+        cmd.extend(["--qa-mode", normalized_qa_mode])
+    for task_id in task_ids:
+        cmd.extend(["--task-id", task_id])
+    for suite_id in suite_ids:
+        cmd.extend(["--suite-id", suite_id])
+    for tag in tags:
+        cmd.extend(["--tag", tag])
+    for term in contains:
+        cmd.extend(["--contains", term])
+    proc = subprocess.run(
+        cmd,
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "harness run failed")
+    payload = json.loads(proc.stdout)
+    if not isinstance(payload, dict):
+        raise ValueError("harness run returned non-object payload")
+    return payload
+
+
+def _write_markdown(path: Path, report: Dict[str, Any]) -> None:
+    lines: List[str] = []
+    lines.append(f"# KPI benchmark pack: {report['pack_id']}")
+    lines.append("")
+    lines.append(f"- generated_at: {report['generated_at']}")
+    lines.append(f"- repeats: {report['repeats']}")
+    lines.append(f"- timeout_cap: {report['timeout_cap']}")
+    lines.append(f"- runner_id: {report.get('runner_id', 'unknown')}")
+    lines.append(f"- qa_mode: {report.get('qa_mode', 'off')}")
+    lines.append(f"- benchmark_mode: {report.get('benchmark_mode', 'standard')}")
+    lines.append(f"- runtime_isolation: {report.get('runtime_isolation', 'unknown')}")
+    lines.append("")
+    lines.append("## Overall KPI")
+    lines.append("")
+    overall = report["overall_kpis"]
+    lines.append(f"- scenario_success_rate: {overall['scenario_success_rate']}")
+    lines.append(f"- primary_success_rate: {overall['primary_success_rate']}")
+    lines.append(f"- reproducibility_rate: {overall['reproducibility_rate']}")
+    lines.append(f"- progress_stop_failure_rate: {overall['progress_stop_failure_rate']}")
+    lines.append(f"- self_recovery_rate: {overall['self_recovery_rate']}")
+    lines.append(f"- intervention_rate: {overall['intervention_rate']}")
+    lines.append(f"- avg_time_seconds: {overall['avg_time_seconds']}")
+    lines.append(f"- flaky_rate: {overall['flaky_rate']}")
+    lines.append("")
+    lines.append("## Suite breakdown")
+    lines.append("")
+    for suite in report["suites"]:
+        summary = suite["summary"]
+        kpis = summary.get("kpi_metrics") or {}
+        lines.append(f"### {suite['suite_id']}")
+        lines.append(f"- suite_path: {suite['suite_path']}")
+        lines.append(f"- artifact_dir: {suite['artifact_dir']}")
+        lines.append(f"- scenario_success_rate: {kpis.get('scenario_success_rate')}")
+        lines.append(f"- primary_success_rate: {kpis.get('primary_success_rate')}")
+        lines.append(f"- reproducibility_rate: {kpis.get('reproducibility_rate')}")
+        lines.append(f"- progress_stop_failure_rate: {kpis.get('progress_stop_failure_rate')}")
+        lines.append(f"- self_recovery_rate: {kpis.get('self_recovery_rate')}")
+        lines.append(f"- intervention_rate: {kpis.get('intervention_rate')}")
+        lines.append("")
+    harness = report.get("harness")
+    if isinstance(harness, dict):
+        lines.append("## Harness")
+        lines.append("")
+        lines.append(f"- artifact_dir: {harness.get('artifact_dir')}")
+        summary = harness.get("summary") if isinstance(harness.get("summary"), dict) else {}
+        for key in (
+            "task_count",
+            "repeats",
+            "pass_at_1",
+            "pass_at_k",
+            "pass_all_k",
+            "reason_code_total",
+        ):
+            if key in summary:
+                lines.append(f"- {key}: {summary.get(key)}")
+        top_reason_codes = harness.get("top_reason_codes")
+        if isinstance(top_reason_codes, list) and top_reason_codes:
+            lines.append("")
+            lines.append("### Harness top reason codes")
+            for item in top_reason_codes[:10]:
+                if not isinstance(item, dict):
+                    continue
+                lines.append(f"- {item.get('reason_code')}: {item.get('count')}")
+    path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def _try_push_pack_metrics(out_dir: Path) -> None:
+    """Upload the final pack artifact when metrics upload was explicitly enabled."""
+    if not MONITORING_CONFIG.exists():
+        print("\n  모니터링 서버 설정이 없어 pack 통합 지표 업로드를 건너뜁니다.")
+        print("  연결: python scripts/gaia_monitor_connect.py <서버주소> --token <토큰>")
+        return
+    if not PUSH_METRICS.exists():
+        return
+
+    print("\n  📡 모니터링 서버로 pack 통합 지표 업로드 중...")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(PUSH_METRICS),
+            "--suite-dir",
+            str(out_dir),
+            "--no-share-suite",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        print("  pack 통합 지표 업로드 완료 ✅")
+        if result.stdout.strip():
+            print(f"  {result.stdout.strip()}")
+        return
+    print("  pack 통합 지표 업로드 실패 (벤치마크 결과는 정상 저장됨)")
+    if result.stderr.strip():
+        print(f"  오류: {result.stderr.strip()}")
+    if result.stdout.strip():
+        print(f"  출력: {result.stdout.strip()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run multiple GAIA benchmark suites and aggregate KPI metrics.")
+    parser.add_argument("--suite", action="append", default=[], help="Path to a suite JSON. Repeatable.")
+    parser.add_argument("--suite-manifest", help="Path to a manifest JSON with a suites array.")
+    parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--timeout-cap", type=int, default=MIN_BENCHMARK_TIMEOUT_SEC)
+    parser.add_argument("--session-prefix", default="kpi-pack")
+    parser.add_argument(
+        "--runner-id",
+        default="",
+        help="Human/team runner identifier recorded in artifacts and metrics. Defaults to GAIA_RUNNER_ID or user@host.",
+    )
+    parser.add_argument(
+        "--qa-mode",
+        choices=QA_MODE_CHOICES,
+        default="off",
+        help="Forward adaptive QA mode to every suite run; deep/deep_adaptive_qa is the human-comparison Deep QA benchmark profile.",
+    )
+    parser.add_argument(
+        "--runtime-isolation",
+        choices=RUNTIME_ISOLATION_CHOICES,
+        default=os.getenv("GAIA_BENCHMARK_RUNTIME_ISOLATION", "warm-process-cold-state"),
+        help="Forward benchmark runtime isolation to every suite run.",
+    )
+    parser.add_argument("--push-metrics", action="store_true", help="Forward metrics upload to each suite run.")
+    parser.add_argument("--harness-task-id", action="append", default=[], dest="harness_task_ids")
+    parser.add_argument("--harness-suite-id", action="append", default=[], dest="harness_suite_ids")
+    parser.add_argument("--harness-tag", action="append", default=[], dest="harness_tags")
+    parser.add_argument("--harness-contains", action="append", default=[], dest="harness_contains")
+    parser.add_argument("--harness-repeats", type=int)
+    parser.add_argument("--harness-timeout-sec", type=int)
+    args = parser.parse_args()
+
+    env = os.environ.copy()
+    runner_id = resolve_runner_id(args.runner_id, env)
+    env["GAIA_RUNNER_ID"] = runner_id
+    normalized_qa_mode = _normalize_qa_mode(str(args.qa_mode or ""))
+    benchmark_mode = _benchmark_mode_label(normalized_qa_mode)
+    runtime_isolation = _normalize_runtime_isolation(str(args.runtime_isolation or ""))
+    env["GAIA_BENCHMARK_RUNTIME_ISOLATION"] = runtime_isolation
+    runtime_policy = _build_runtime_policy(runtime_isolation)
+    try:
+        suite_paths = _resolve_suite_paths(suite_args=args.suite, suite_manifest=args.suite_manifest)
+    except ValueError as exc:
+        parser.error(str(exc))
+    runtime_policy = _prewarm_benchmark_runtime(runtime_isolation, env)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pack_id = f"kpi_pack_{timestamp}"
+    out_dir = ARTIFACT_ROOT / pack_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    suite_reports: List[Dict[str, Any]] = []
+    all_rows: List[Dict[str, Any]] = []
+    for idx, suite_path in enumerate(suite_paths, start=1):
+        suite_report = _run_suite(
+            suite_path,
+            repeats=max(1, int(args.repeats)),
+            timeout_cap=_effective_timeout_cap(int(args.timeout_cap)),
+            session_prefix=f"{args.session_prefix}-{idx}",
+            push_metrics=bool(args.push_metrics),
+            runner_id=runner_id,
+            env=env,
+            qa_mode=normalized_qa_mode,
+            runtime_isolation=runtime_isolation,
+        )
+        suite_reports.append(suite_report)
+        all_rows.extend(suite_report["rows"])
+        if int(suite_report.get("exit_code") or 0) != 0:
+            detail = str(suite_report.get("stderr") or suite_report.get("stdout") or "").strip()
+            tail = "\n".join(detail.splitlines()[-20:]).strip()
+            raise RuntimeError(
+                f"suite run failed before a valid benchmark completed: {suite_report['suite_path']} "
+                f"(exit_code={suite_report['exit_code']})"
+                + (f"\n{tail}" if tail else "")
+            )
+
+    overall_kpis = _compute_pack_kpis(all_rows, max(1, int(args.repeats)))
+    harness_report: Dict[str, Any] | None = None
+    if args.harness_task_ids or args.harness_suite_ids or args.harness_tags or args.harness_contains:
+        harness_payload = _run_harness(
+            task_ids=[str(v) for v in args.harness_task_ids],
+            suite_ids=[str(v) for v in args.harness_suite_ids],
+            tags=[str(v) for v in args.harness_tags],
+            contains=[str(v) for v in args.harness_contains],
+            repeats=max(1, int(args.harness_repeats or args.repeats)),
+            timeout_sec=_effective_timeout_cap(int(args.harness_timeout_sec or args.timeout_cap)),
+            env=env,
+            qa_mode=normalized_qa_mode,
+        )
+        harness_report = {
+            "run_id": harness_payload.get("run_id"),
+            "artifact_dir": harness_payload.get("artifact_dir"),
+            "selection": harness_payload.get("selection"),
+            "summary": harness_payload.get("summary"),
+            "grade_summary": harness_payload.get("grade_summary"),
+            "reason_code_summary": harness_payload.get("reason_code_summary"),
+            "top_reason_codes": harness_payload.get("top_reason_codes"),
+        }
+    report = {
+        "pack_id": pack_id,
+        "generated_at": timestamp,
+        "repeats": max(1, int(args.repeats)),
+        "timeout_cap": _effective_timeout_cap(int(args.timeout_cap)),
+        "push_metrics": bool(args.push_metrics),
+        "runner_id": runner_id,
+        "qa_mode": normalized_qa_mode or "off",
+        "benchmark_mode": benchmark_mode,
+        "runtime_isolation": runtime_isolation,
+        "runtime_policy": runtime_policy,
+        "suites": [
+            {
+                "suite_id": suite["suite_id"],
+                "suite_path": suite["suite_path"],
+                "artifact_dir": suite["artifact_dir"],
+                "summary": suite["summary"],
+            }
+            for suite in suite_reports
+        ],
+        "overall_kpis": overall_kpis,
+    }
+    if harness_report is not None:
+        report["harness"] = harness_report
+    (out_dir / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "results.json").write_text(json.dumps(all_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_markdown(out_dir / "summary.md", report)
+    if args.push_metrics:
+        _try_push_pack_metrics(out_dir)
+    print(json.dumps({"artifact_dir": str(out_dir), "overall_kpis": overall_kpis}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

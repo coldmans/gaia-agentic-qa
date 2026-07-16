@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaia-agentic-qa"
+version = "0.2.0"
+description = "Evidence-driven browser QA agent with role/ref actions and independent verification"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "coldmans" }]
+keywords = ["browser-agent", "qa-automation", "llm", "playwright", "testing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = [
+  "numpy>=1.24.0",
+  "openai>=1.0.0",
+  "playwright>=1.40.0",
+  "prompt-toolkit>=3.0.47",
+  "pydantic>=2.5.0",
+  "python-dotenv>=1.0.0",
+  "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+gemini = ["google-genai>=1.0.0"]
+gui = [
+  "Pillow>=10.0.0",
+  "PySide6>=6.6.0",
+  "websockets>=12.0",
+]
+planner = ["pypdf>=3.17.0"]
+server = ["fastapi>=0.110.0", "uvicorn[standard]>=0.29.0"]
+telegram = ["python-telegram-bot>=21.0"]
+all = [
+  "Pillow>=10.0.0",
+  "PySide6>=6.6.0",
+  "fastapi>=0.110.0",
+  "google-genai>=1.0.0",
+  "pypdf>=3.17.0",
+  "python-telegram-bot>=21.0",
+  "uvicorn[standard]>=0.29.0",
+  "websockets>=12.0",
+]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+gaia = "gaia.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/coldmans/gaia-agentic-qa"
+Repository = "https://github.com/coldmans/gaia-agentic-qa"
+Issues = "https://github.com/coldmans/gaia-agentic-qa/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gaia", "gaia.*"]
+exclude = ["gaia.tests", "gaia.tests.*", "gaia-battle-web", "gaia-battle-web.*"]
+
+[tool.setuptools.package-data]
+gaia = [
+  "_runtime/openclaw/LICENSE",
+  "_runtime/openclaw/gaia-embedded-browser-server.bundle.mjs",
+  "_runtime/openclaw/package-lock.json",
+  "_runtime/openclaw/package.json",
+  "src/gui/assets/*.png",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["gaia/tests/unit"]
+addopts = "-ra"

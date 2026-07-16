@@ -1,0 +1,101 @@
+{
+  "suite_id": "kakao_map_public_v2",
+  "site": {
+    "name": "Kakao Map",
+    "base_url": "https://map.kakao.com/",
+    "mode": "public_readonly"
+  },
+  "grader_configs": {
+    "reason_codes": {
+      "forbidden_reason_codes": [
+        "user_intervention_missing"
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "KAKAOMAP_001_HOME_MAP",
+      "name": "지도 홈 주요 영역 확인",
+      "url": "https://map.kakao.com/",
+      "goal": "카카오맵 홈에서 지도 캔버스, 장소 검색 입력, 확대 축소 컨트롤 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KAKAOMAP_002_PLACE_SEARCH",
+      "name": "장소 검색 결과 확인",
+      "url": "https://map.kakao.com/?q=%EC%84%9C%EC%9A%B8%EC%97%AD",
+      "goal": "서울역 검색 결과에서 장소명, 주소, 지도 마커 또는 주변 장소 목록 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KAKAOMAP_003_CATEGORY_NEARBY",
+      "name": "주변 카테고리 확인",
+      "url": "https://map.kakao.com/?q=%EA%B0%95%EB%82%A8%EC%97%AD%20%EC%B9%B4%ED%8E%98",
+      "goal": "강남역 카페 검색 화면에서 장소 목록, 별점 또는 주소 정보가 보이는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KAKAOMAP_004_ROUTE_PANEL",
+      "name": "경로 탐색 패널 확인",
+      "url": "https://map.kakao.com/link/by/subway/seoul/서울역/경복궁",
+      "goal": "카카오맵 공식 길찾기 링크로 열린 서울역에서 경복궁까지의 경로 화면에서 출발역, 도착역, 대중교통 경로 또는 지도 영역 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KAKAOMAP_005_MAP_CONTROL",
+      "name": "지도 표시 조작 확인",
+      "url": "https://map.kakao.com/?q=%EA%B2%BD%EB%B3%B5%EA%B6%81",
+      "goal": "경복궁 지도 화면에서 확대 축소나 지도 유형 컨트롤을 선택해 지도 표시가 바뀌는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "KAKAOMAP_006_INU_TRANSIT_ROUTE_TIME",
+      "name": "인천대학교 송도캠퍼스 2008년 스카이뷰 확인",
+      "url": "https://map.kakao.com/",
+      "goal": "카카오맵 검색창에 \"인천대학교 송도캠퍼스\"를 입력해 검색 결과를 선택한다. 이후 지도를 스카이뷰로 바꾸고 년도를 2008년으로 설정했을 때 지도가 스카이뷰로 정상 표시되는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [
+        "인천대학교 송도캠퍼스",
+        "스카이뷰",
+        "2008년",
+        "지도",
+        "항공사진"
+      ],
+      "time_budget_sec": 600
+    }
+  ]
+}

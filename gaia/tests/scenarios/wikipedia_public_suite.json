@@ -1,0 +1,100 @@
+{
+  "suite_id": "wikipedia_public_v2",
+  "site": {
+    "name": "Wikipedia Korea",
+    "base_url": "https://ko.wikipedia.org/",
+    "mode": "public_readonly"
+  },
+  "grader_configs": {
+    "reason_codes": {
+      "forbidden_reason_codes": [
+        "user_intervention_missing"
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "WIKI_001_PORTAL_OVERVIEW",
+      "name": "지식 포털 주요 영역 확인",
+      "url": "https://ko.wikipedia.org/wiki/위키백과:대문",
+      "goal": "위키백과 대문에서 오늘의 알찬 글, 알고 계십니까, 참여 안내 같은 공개 지식 포털 영역 중 두 가지를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "WIKI_002_SEARCH_AI",
+      "name": "백과 검색 결과 확인",
+      "url": "https://ko.wikipedia.org/w/index.php?search=%EC%9D%B8%EA%B3%B5%EC%A7%80%EB%8A%A5",
+      "goal": "위키백과 검색 결과에서 인공지능 관련 문서 후보 목록과 문서로 이동할 수 있는 링크를 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "WIKI_003_ARTICLE_STRUCTURE",
+      "name": "문서 상세 구조 확인",
+      "url": "https://ko.wikipedia.org/wiki/인공지능",
+      "goal": "인공지능 문서에서 정의 요약, 목차, 정보상자 또는 참고 문헌 같은 문서 구조가 보이는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "WIKI_004_CATEGORY_BROWSE",
+      "name": "분류 목록 탐색",
+      "url": "https://ko.wikipedia.org/wiki/분류:과학",
+      "goal": "과학 분류 화면에서 하위 분류나 문서 목록처럼 지식 체계가 나뉘어 보이는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "WIKI_005_TOC_LANGUAGE_NAV",
+      "name": "문서 내부 탐색 확인",
+      "url": "https://ko.wikipedia.org/wiki/대한민국",
+      "goal": "대한민국 문서에서 목차나 언어 링크처럼 화면 안에서 이동하는 탐색 요소를 선택해 관련 영역이 보이는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": false
+      },
+      "expected_signals": [],
+      "time_budget_sec": 600
+    },
+    {
+      "id": "WIKI_006_GAIA_HUMAN_TEST_V1",
+      "name": "사용자 모임 경유 K-pop 포털 정보 확인",
+      "url": "https://ko.wikipedia.org/wiki/위키백과:대문",
+      "goal": "위키백과에서 사용자 모임을 클릭한 뒤, 포털 영역에서 K-pop을 선택했을 때 오늘의 아티스트나 오늘의 그림 같은 정보가 화면에 나타나는지 확인해줘.",
+      "constraints": {
+        "allow_navigation": true,
+        "require_ref_only": true,
+        "require_state_change": true
+      },
+      "expected_signals": [
+        "사용자 모임",
+        "K-pop",
+        "오늘의 아티스트",
+        "오늘의 그림"
+      ],
+      "time_budget_sec": 600
+    }
+  ]
+}

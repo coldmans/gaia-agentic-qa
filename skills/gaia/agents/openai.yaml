@@ -1,0 +1,4 @@
+interface:
+  display_name: "GAIA Agentic QA"
+  short_description: "Run and diagnose evidence-driven browser QA"
+  default_prompt: "Run this web QA goal with GAIA, preserve role/ref evidence, and report the verified outcome and failure reason."

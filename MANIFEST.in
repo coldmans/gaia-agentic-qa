@@ -1,0 +1,9 @@
+include LICENSE
+include THIRD_PARTY_NOTICES.md
+include gaia/_runtime/openclaw/LICENSE
+include gaia/_runtime/openclaw/gaia-embedded-browser-server.bundle.mjs
+include gaia/_runtime/openclaw/package-lock.json
+include gaia/_runtime/openclaw/package.json
+prune gaia/_runtime/openclaw/node_modules
+prune gaia-battle-web
+recursive-include gaia/src/gui/assets *.png
